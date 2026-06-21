@@ -825,6 +825,16 @@ printf "\n  ${C_DIM}Administration du serveur :${C_RESET} ${C_BOLD}vps-helper${C
 printf '\n'
 MOTDEOF
     chmod +x /etc/update-motd.d/00-studiokyne
+
+    # Sur Ubuntu 24.04, pam_motd.so est configuré avec noupdate par défaut :
+    # les scripts update-motd.d ne sont exécutés qu'au boot, pas à chaque login.
+    # On supprime ce flag pour que le MOTD reflète l'état courant à chaque connexion.
+    if grep -q 'pam_motd.so noupdate' /etc/pam.d/sshd 2>/dev/null; then
+        backup_file /etc/pam.d/sshd
+        sed -i 's/pam_motd.so noupdate$/pam_motd.so/' /etc/pam.d/sshd
+    fi
+    run-parts /etc/update-motd.d/ > /run/motd.dynamic 2>/dev/null || true
+
     log_ok "MOTD personnalisé installé."
 }
 
