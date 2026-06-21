@@ -112,21 +112,32 @@ Déclenché sur `push`, `pull_request`, et `workflow_call` (pour être appelé d
 - ShellCheck en mode strict (`severity: warning`) via `ludeeus/action-shellcheck@2.0.0`
 - Extraction + `bash -n` des deux heredocs (`MOTDEOF`, `HELPEREOF`)
 
+### auto-release.yml
+
+Déclenché sur push vers `main`. Enchaîne en un seul job : lint → calcul de version → build → publication.
+
+Format de version : `YYYY.MM.DD.N` (N incrémental sur la journée, repart à 1 chaque jour).
+Exemple : `v2026.06.21.1`, puis `v2026.06.21.2` si un second push a lieu le même jour.
+
+L'algorithme de calcul : liste les tags `v{DATE}.*` existants via `git tag -l`, prend le N maximum, incrémente.
+
+Aucune convention de message de commit requise — chaque push vers `main` produit une release.
+
 ### release.yml
 
-Déclenché sur push de tag `v*.*.*`.
+Déclenché sur push de tag `v*.*.*` (créé par release-please ou manuellement).
 
 1. Appelle `lint.yml` via `workflow_call` — la release échoue si le lint échoue
 2. Extrait la version (`v1.2.0` → `1.2.0`) depuis le nom du tag
 3. Injecte la version dans une **copie** du script (`sed` sur `SCRIPT_VERSION`) — la branche principale conserve `0.0.0-dev`
 4. Publie une GitHub Release avec le script versionné comme asset `init-vps.sh`
-5. Notes de version générées automatiquement (`generate_release_notes: true`)
+5. Notes de version générées automatiquement
 
 ---
 
 ## Versioning
 
-- La constante `SCRIPT_VERSION="0.0.0-dev"` est présente dans le script source.
-- Un tag `vX.Y.Z` déclenche la release qui substitue cette valeur dans la copie publiée.
+- La constante `SCRIPT_VERSION="0.0.0-dev"` est présente dans le script source sur `main`.
+- Un push sur `main` calcule automatiquement la version `YYYY.MM.DD.N` et la substitue dans la copie publiée.
 - La version est incluse dans le résumé final (`print_summary()`) et dans le log `/var/log/init-vps.log`.
 - Sur le serveur, `vps-helper version` affiche la version de `init-vps.sh` utilisée pour l'initialisation (via `INIT_VPS_VERSION` dans vps-helper, injectée par `sed -i` lors de l'étape 14).

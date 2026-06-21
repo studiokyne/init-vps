@@ -1,0 +1,58 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  auto-release:
+    name: Lint + version + release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Syntax check — init-vps.sh
+        run: bash -n init-vps.sh
+
+      - name: ShellCheck — init-vps.sh
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: warning
+
+      - name: Syntax check — heredocs embarqués
+        run: |
+          awk "/^cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" \
+            init-vps.sh > /tmp/motd_check.sh
+          bash -n /tmp/motd_check.sh
+          awk "/^cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" \
+            init-vps.sh > /tmp/helper_check.sh
+          bash -n /tmp/helper_check.sh
+
+      - name: Compute version
+        id: version
+        run: |
+          DATE=$(date -u +%Y.%m.%d)
+          LAST_N=$(git tag -l "v${DATE}.*" | grep -oP '\d+$' | sort -n | tail -1)
+          N=$(( ${LAST_N:-0} + 1 ))
+          echo "tag=v${DATE}.${N}" >> "$GITHUB_OUTPUT"
+          echo "version=${DATE}.${N}" >> "$GITHUB_OUTPUT"
+
+      - name: Build versioned script
+        run: |
+          sed "s/^SCRIPT_VERSION=.*/SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
+            init-vps.sh > /tmp/init-vps.sh
+          chmod +x /tmp/init-vps.sh
+          bash -n /tmp/init-vps.sh
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "init-vps ${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+          files: /tmp/init-vps.sh

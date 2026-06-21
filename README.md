@@ -2,7 +2,7 @@
 
 Script bash d'initialisation et de durcissement de VPS Ubuntu/Debian, prêt pour [Dokploy](https://dokploy.com).
 
-![Lint](https://github.com/studiokyne/init-vps/actions/workflows/lint.yml/badge.svg)
+![Lint](https://github.com/seikkodev/init-vps/actions/workflows/lint.yml/badge.svg)
 
 ---
 
@@ -110,11 +110,15 @@ Audit de lecture seule du durcissement. Vérifie :
 
 ## Versioning
 
-Chaque release correspond à un tag Git `vX.Y.Z` (semver). Le workflow CI/CD :
+Chaque push sur `main` déclenche automatiquement une release. Le format de version est `YYYY.MM.DD.N` (N = numéro d'incrément sur la journée, repart à 1 chaque jour).
 
-1. Lance les checks ShellCheck + syntaxe sur le tag
-2. Injecte la version dans `SCRIPT_VERSION` du script (substitution sur une copie — la branche principale conserve `0.0.0-dev`)
-3. Publie une GitHub Release avec le script versionné en asset téléchargeable
+Exemples : `2026.06.21.1`, `2026.06.21.2`, `2026.07.01.1`
+
+Le workflow CI/CD sur chaque push :
+1. Lance ShellCheck + vérification syntaxique du script et des heredocs
+2. Calcule la prochaine version du jour
+3. Injecte la version dans `SCRIPT_VERSION` (sur une copie — la branche `main` conserve `0.0.0-dev`)
+4. Publie une GitHub Release avec le script versionné en asset
 
 La version installée sur le serveur est accessible via `vps-helper version`.
 
