@@ -1,0 +1,33 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+jobs:
+  lint:
+    name: ShellCheck + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check — init-vps.sh
+        run: bash -n init-vps.sh
+
+      - name: ShellCheck — init-vps.sh (strict)
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          severity: warning
+          scandir: '.'
+          additional_files: 'init-vps.sh'
+
+      - name: Extract and check embedded MOTD heredoc
+        run: |
+          awk "/^cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" init-vps.sh > /tmp/motd_check.sh
+          bash -n /tmp/motd_check.sh && echo "MOTD heredoc syntax OK"
+
+      - name: Extract and check embedded vps-helper heredoc
+        run: |
+          awk "/^cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" init-vps.sh > /tmp/helper_check.sh
+          bash -n /tmp/helper_check.sh && echo "vps-helper heredoc syntax OK"
