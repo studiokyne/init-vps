@@ -130,9 +130,16 @@ detect_os() {
 ###############################################################################
 # HELPERS — sauvegarde, test de config SSH
 ###############################################################################
+# Sauvegarde un fichier hors de son répertoire d'origine, sous
+# /var/backups/init-vps/, en préservant le chemin absolu. Écrire le .bak à côté
+# de l'original casse les répertoires scannés en entier (ex. /etc/apt/apt.conf.d
+# où apt râle « invalid filename extension » à chaque update).
 backup_file() {
     local f="$1"
-    [[ -f "$f" ]] && cp -a "$f" "${f}.bak-$(date +%Y%m%d%H%M%S)"
+    [[ -f "$f" ]] || return 0
+    local dest="/var/backups/init-vps${f}.bak-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$(dirname "$dest")"
+    cp -a "$f" "$dest"
     return 0
 }
 
@@ -688,11 +695,21 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 # Log des paquets "martian"
 net.ipv4.conf.all.log_martians = 1
 
+# Équivalents IPv6 (Hetzner et la plupart des VPS fournissent de l'IPv6).
+# NB : on ne touche PAS à accept_ra — le désactiver casserait la route par
+# défaut IPv6 sur les VPS configurés en SLAAC/RA.
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+
 # IMPORTANT : requis par le réseau Docker, ne pas désactiver
 net.ipv4.ip_forward = 1
 EOF
-    sysctl --system >/dev/null
-    log_ok "Durcissement réseau appliqué."
+    # --system charge tous les fichiers ; on ignore les clés IPv6 absentes si
+    # l'IPv6 est désactivé au boot (sysctl --system n'échoue pas là-dessus).
+    sysctl --system >/dev/null 2>&1 || sysctl --system >/dev/null
+    log_ok "Durcissement réseau appliqué (IPv4 + IPv6)."
 }
 
 ###############################################################################
@@ -704,15 +721,30 @@ step_swap() {
         log_info "Swap ignoré (0 Go demandé, ou swap déjà présent)."
         return
     fi
-    if swapon --show | grep -q '/swapfile'; then
-        log_warn "Un swapfile existe déjà, étape ignorée."
+    # Détecte tout swap déjà actif (swapfile OU partition fournie par le provider)
+    # pour ne pas empiler un swapfile inutile par-dessus.
+    if swapon --show --noheadings 2>/dev/null | grep -q .; then
+        log_warn "Un swap est déjà actif sur ce serveur, étape ignorée."
         return
     fi
 
-    fallocate -l "${SWAP_SIZE_GB}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB*1024)) status=none
+    # fallocate peut réussir mais produire un fichier que swapon refuse (extents
+    # non contigus sur certains FS type ZFS/btrfs). On repasse alors sur dd.
+    rm -f /swapfile
+    if ! fallocate -l "${SWAP_SIZE_GB}G" /swapfile; then
+        dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB*1024)) status=none
+    fi
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null
-    swapon /swapfile
+    if ! swapon /swapfile 2>/dev/null; then
+        log_warn "swapon a échoué (probable fichier non contigu), recréation via dd..."
+        swapoff /swapfile 2>/dev/null || true
+        rm -f /swapfile
+        dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_SIZE_GB*1024)) status=none
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null
+        swapon /swapfile || error "Impossible d'activer le swap sur /swapfile."
+    fi
     grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
     backup_file /etc/sysctl.d/99-swap.conf
@@ -755,6 +787,25 @@ step_motd() {
     fi
     systemctl disable --now motd-news.timer >/dev/null 2>&1 || true
     : > /etc/motd 2>/dev/null || true
+
+    # /etc/legal (notice « free software / NO WARRANTY ») est affiché à chaque
+    # connexion par pam_motd.so — on le vide pour un login épuré.
+    if [[ -s /etc/legal ]]; then
+        backup_file /etc/legal
+        : > /etc/legal 2>/dev/null || true
+    fi
+
+    # Le hint « To run a command as administrator… » vient de /etc/bash.bashrc et
+    # s'affiche tant que ~/.sudo_as_admin_successful est absent. On crée le
+    # marqueur pour le compte admin (mécanisme prévu par Ubuntu, non invasif).
+    if [[ -n "${ADMIN_USER:-}" ]] && id "$ADMIN_USER" &>/dev/null; then
+        local admin_home
+        admin_home="$(getent passwd "$ADMIN_USER" | cut -d: -f6)"
+        if [[ -n "$admin_home" && -d "$admin_home" ]]; then
+            touch "${admin_home}/.sudo_as_admin_successful"
+            chown "${ADMIN_USER}:${ADMIN_USER}" "${admin_home}/.sudo_as_admin_successful" 2>/dev/null || true
+        fi
+    fi
 
     mkdir -p /etc/update-motd.d
     backup_file /etc/update-motd.d/00-studiokyne
@@ -1103,6 +1154,9 @@ FRAGEOF
     fi
 
     # --- 4. rechargement ---
+    # Selon la version de Dokploy, Traefik tourne soit comme service Swarm
+    # (docker service), soit comme conteneur classique (docker run). On gère
+    # les deux : service d'abord, puis conteneur nommé dokploy-traefik.
     if [[ "$changed" -eq 1 ]]; then
         if docker service ls --format '{{.Name}}' 2>/dev/null | grep -q '^dokploy-traefik$'; then
             if docker service update --force dokploy-traefik >/dev/null 2>&1; then
@@ -1110,8 +1164,14 @@ FRAGEOF
             else
                 warn "Rechargement Traefik échoué — relance : docker service update --force dokploy-traefik"
             fi
+        elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^dokploy-traefik$'; then
+            if docker restart dokploy-traefik >/dev/null 2>&1; then
+                ok "Conteneur Traefik redémarré (config statique appliquée)."
+            else
+                warn "Redémarrage Traefik échoué — relance : docker restart dokploy-traefik"
+            fi
         else
-            warn "Service dokploy-traefik introuvable — redémarre Traefik pour appliquer HTTP/3."
+            warn "Traefik (dokploy-traefik) introuvable — redémarre-le pour appliquer HTTP/3."
         fi
     else
         info "Configuration Traefik déjà optimale, aucun changement."
@@ -1398,6 +1458,18 @@ step_traefik_tuning() {
 ###############################################################################
 # RÉSUMÉ FINAL
 ###############################################################################
+# Vrai si un redémarrage est nécessaire : soit le drapeau posé par apt
+# (/var/run/reboot-required), soit un kernel plus récent installé mais pas
+# encore chargé (fréquent après le dist-upgrade initial).
+reboot_is_pending() {
+    [[ -f /var/run/reboot-required ]] && return 0
+    local running newest
+    running="$(uname -r)"
+    newest="$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null \
+        | sed 's|.*/vmlinuz-||' | sort -V | tail -n1)"
+    [[ -n "$newest" && "$newest" != "$running" ]]
+}
+
 print_summary() {
     # Calculé ici (et non en début de script) pour éviter tout décalage avec
     # le fuseau horaire défini en cours de route (step_system_misc).
@@ -1420,6 +1492,9 @@ print_summary() {
         echo "Dokploy           : http://${SERVER_IP}:3000"
         echo "Fichier log       : ${LOG_FILE}"
         [[ -f "$PASSWORD_FILE" ]] && echo "Mot de passe sudo : ${PASSWORD_FILE} (à supprimer une fois noté)"
+        if reboot_is_pending; then
+            echo "Redémarrage       : REQUIS (nouveau kernel installé, pas encore chargé)"
+        fi
         echo ""
         echo "PROCHAINES ÉTAPES"
         echo "──────────────────────────────────────────────────"
@@ -1442,6 +1517,11 @@ print_summary() {
             echo ""
             echo "6. Supprimer le fichier mot de passe une fois noté :"
             echo "     shred -u ${PASSWORD_FILE}"
+        fi
+        if reboot_is_pending; then
+            echo ""
+            echo "⚠ Un nouveau kernel a été installé : redémarrer le serveur pour le charger :"
+            echo "     reboot"
         fi
     } | tee "$SUMMARY_FILE" | tee -a "$LOG_FILE"
 
