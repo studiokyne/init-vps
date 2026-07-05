@@ -59,7 +59,6 @@ TIMEZONE=""
 SWAP_SIZE_GB=0
 DOKPLOY_RESTRICT_IP=""
 ADVERTISE_ADDR=""
-WEBHOOK_URL=""
 PASSWORD_FILE=""
 SERVER_IP=""
 SUMMARY_FILE=""
@@ -209,14 +208,6 @@ validate_ip_loose() {
     is_valid_ipv4 "$val" && return 0
     [[ "$val" == *:* ]] && return 0
     return 1
-}
-
-validate_url() {
-    local v="$1"
-    [[ -z "$v" ]] && return 0
-    # HTTPS uniquement (Discord/Slack n'utilisent que ça) — limite le risque
-    # d'envoyer des infos de fin de script en clair sur le réseau.
-    [[ "$v" =~ ^https://[^[:space:]]+$ ]]
 }
 
 ###############################################################################
@@ -378,13 +369,6 @@ collect_advertise_addr() {
     prompt ADVERTISE_ADDR "Adresse IP à utiliser pour Docker Swarm (confirme ou corrige)" "$suggested" validate_ip_loose
 }
 
-collect_webhook() {
-    log_step "Notification de fin de script (optionnel)"
-    if confirm "Recevoir une notification (webhook Discord ou Slack) une fois le script terminé ?" "n"; then
-        prompt WEBHOOK_URL "URL du webhook (https uniquement)" "" validate_url
-    fi
-}
-
 collect_timezone() {
     log_step "Fuseau horaire"
     prompt TIMEZONE "Fuseau horaire (format Region/Ville)" "Europe/Paris" validate_timezone
@@ -392,11 +376,10 @@ collect_timezone() {
 
 show_recap() {
     log_step "Récapitulatif avant exécution"
-    local swap_line dokploy_line advertise_line webhook_line
+    local swap_line dokploy_line advertise_line
     [[ "$SWAP_SIZE_GB" -eq 0 ]] && swap_line="aucun" || swap_line="${SWAP_SIZE_GB} Go"
     [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="ouvert temporairement à tous"
     [[ -n "$ADVERTISE_ADDR" ]] && advertise_line="${ADVERTISE_ADDR}" || advertise_line="auto-détection (Dokploy)"
-    [[ -n "$WEBHOOK_URL" ]] && webhook_line="activée" || webhook_line="désactivée"
 
     cat <<EOF
   Hostname                  : ${SERVER_HOSTNAME}
@@ -407,7 +390,6 @@ show_recap() {
   Swap                      : ${swap_line}
   Accès Dokploy (port 3000) : ${dokploy_line}
   Adresse Docker Swarm       : ${advertise_line}
-  Notification webhook       : ${webhook_line}
 EOF
     echo ""
 }
@@ -1314,6 +1296,48 @@ EOF
 ###############################################################################
 # 16. INSTALLATION DOKPLOY
 ###############################################################################
+# Pré-installe Docker avant Dokploy. L'install.sh de Dokploy délègue à
+# get.docker.com, qui déduit le nom de code APT depuis /etc/os-release : sur une
+# version d'Ubuntu/Debian trop récente (ex. 26.04 « resolute »), le dépôt Docker
+# n'existe pas encore et l'installation échoue (« docker: not found »). On
+# installe donc Docker nous-mêmes en repliant sur la dernière LTS supportée si
+# le dépôt du codename courant est absent. Une fois Docker présent, Dokploy le
+# détecte et saute cette étape.
+ensure_docker() {
+    if command -v docker &>/dev/null; then
+        log_info "Docker déjà présent, pré-installation ignorée."
+        return
+    fi
+    log_info "Pré-installation de Docker (avant Dokploy)..."
+
+    local id codename
+    id="$( . /etc/os-release; echo "${ID:-ubuntu}" )"
+    codename="$( . /etc/os-release; echo "${VERSION_CODENAME:-}" )"
+    [[ "$id" == "ubuntu" || "$id" == "debian" ]] || id="ubuntu"
+
+    local repo_base="https://download.docker.com/linux/${id}"
+    if [[ -z "$codename" ]] || ! curl -fsSL "${repo_base}/dists/${codename}/Release" >/dev/null 2>&1; then
+        local fallback
+        if [[ "$id" == "debian" ]]; then fallback="bookworm"; else fallback="noble"; fi
+        log_warn "Dépôt Docker indisponible pour « ${codename:-inconnu} », repli sur « ${fallback} »."
+        codename="$fallback"
+    fi
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "${repo_base}/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${repo_base} ${codename} stable" \
+        > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+
+    if ! command -v docker &>/dev/null; then
+        error "Échec de l'installation de Docker (dépôt ${id}/${codename}). Dokploy ne peut pas être installé."
+    fi
+    log_ok "Docker installé (dépôt ${id}/${codename})."
+}
+
 step_dokploy() {
     log_step "Installation de Dokploy (Docker + Swarm inclus)"
 
@@ -1339,6 +1363,8 @@ step_dokploy() {
     else
         log_warn "Adresse réseau non détectée automatiquement, Dokploy tentera sa propre détection."
     fi
+
+    ensure_docker
 
     curl -fsSL https://dokploy.com/install.sh | sh
 
@@ -1423,18 +1449,6 @@ print_summary() {
     log_ok "Résumé sauvegardé dans ${SUMMARY_FILE}"
 }
 
-notify_webhook() {
-    [[ -z "$WEBHOOK_URL" ]] && return
-    local payload msg
-    msg="Initialisation terminee sur $(hostname) - Dokploy : http://${SERVER_IP}:3000"
-    payload=$(printf '{"content":"%s","text":"%s"}' "$msg" "$msg")
-    if curl -fsS -X POST -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1; then
-        log_ok "Notification webhook envoyée."
-    else
-        log_warn "Échec de l'envoi de la notification webhook (vérifier l'URL)."
-    fi
-}
-
 offer_password_cleanup() {
     [[ -f "$PASSWORD_FILE" ]] || return
     if confirm "Mot de passe sudo noté ? Suppression du fichier maintenant ?" "n"; then
@@ -1468,7 +1482,6 @@ main() {
     collect_swap
     collect_dokploy_restrict_ip
     collect_advertise_addr
-    collect_webhook
     show_recap
 
     confirm "Lancer l'initialisation avec ces paramètres ?" "o" \
@@ -1493,7 +1506,6 @@ main() {
     step_traefik_tuning
 
     print_summary
-    notify_webhook
     offer_password_cleanup
 
     log_ok "Initialisation terminée !"
