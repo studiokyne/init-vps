@@ -137,7 +137,9 @@ detect_os() {
 backup_file() {
     local f="$1"
     [[ -f "$f" ]] || return 0
-    local dest="/var/backups/init-vps${f}.bak-$(date +%Y%m%d%H%M%S)"
+    local ts dest
+    ts="$(date +%Y%m%d%H%M%S)"
+    dest="/var/backups/init-vps${f}.bak-${ts}"
     mkdir -p "$(dirname "$dest")"
     cp -a "$f" "$dest"
     return 0
