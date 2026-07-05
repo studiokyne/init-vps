@@ -32,6 +32,7 @@
 #  14. Commande d'aide vps-helper (whitelist, restart, logs, update...)
 #  15. Limitation des logs Docker (rotation 10 Mo x 3 par conteneur)
 #  16. Installation de Dokploy
+#  17. Optimisation Traefik (HTTP/3 + compression Brotli/Zstd, patch idempotent)
 #
 # Résumé final + prochaines étapes, affiché et sauvegardé dans un fichier.
 #
@@ -548,6 +549,7 @@ step_ufw_base() {
     ufw limit "${SSH_PORT}/tcp" comment 'SSH (rate-limited)' >/dev/null
     ufw allow 80/tcp comment 'HTTP' >/dev/null
     ufw allow 443/tcp comment 'HTTPS' >/dev/null
+    ufw allow 443/udp comment 'HTTP/3 QUIC' >/dev/null
 
     # Nettoyage des éventuelles anciennes règles sur le port 3000 (évite les
     # doublons/conflits si le script est relancé avec une restriction IP différente).
@@ -865,7 +867,7 @@ chk_fail() { printf '%b %s\n' "${C_RED}[FAIL]${C_RESET}" "$1"; }
 chk_info() { printf '%b %s\n' "${C_CYAN}[INFO]${C_RESET}" "$1"; }
 chk_sect() { printf '\n%b%s%b\n' "${C_DIM}── " "$1" " ────────────────────────────────────────${C_RESET}"; }
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check"
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -887,6 +889,7 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper logs <conteneur>${C_RESET}    Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter)
   ${C_CYAN}vps-helper update${C_RESET}              Mettre à jour le système (sécurité incluse)
   ${C_CYAN}vps-helper check${C_RESET}               Vérifier l'état du durcissement (lecture seule)
+  ${C_CYAN}vps-helper traefik-tuning${C_RESET}      Activer HTTP/3 + compression Traefik (idempotent)
   ${C_CYAN}vps-helper version${C_RESET}             Afficher la version de init-vps.sh utilisée
   ${C_CYAN}vps-helper help${C_RESET}                Afficher cette aide
 EOF
@@ -1011,6 +1014,128 @@ cmd_version() {
     echo "${INIT_VPS_VERSION}"
 }
 
+cmd_traefik_tuning() {
+    local tconf="/etc/dokploy/traefik/traefik.yml"
+    local mdir="/etc/dokploy/traefik/dynamic"
+    local mconf="${mdir}/middlewares.yml"
+
+    if [[ ! -f "$tconf" ]]; then
+        err "traefik.yml introuvable (${tconf}) — Dokploy est-il installé ?"
+        exit 1
+    fi
+
+    # yq (mikefarah) : indispensable pour un patch YAML sûr et idempotent.
+    if ! command -v yq >/dev/null 2>&1; then
+        info "Installation de yq (mikefarah)..."
+        local arch; arch=$(dpkg --print-architecture)
+        if ! curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${arch}" \
+                -o /usr/local/bin/yq; then
+            err "Téléchargement de yq impossible — optimisation Traefik annulée."
+            exit 1
+        fi
+        chmod +x /usr/local/bin/yq
+    fi
+
+    local changed=0 stamp
+    stamp=$(date +%Y%m%d%H%M%S)
+
+    # --- 1. middlewares.yml : définir le middleware « compression » s'il manque ---
+    mkdir -p "$mdir"
+    [[ -f "$mconf" ]] || printf 'http:\n  middlewares: {}\n' > "$mconf"
+    if [[ "$(yq '.http.middlewares.compression // "null"' "$mconf")" == "null" ]]; then
+        cp -a "$mconf" "${mconf}.bak-${stamp}"
+        local frag; frag=$(mktemp)
+        cat > "$frag" <<'FRAGEOF'
+http:
+  middlewares:
+    compression:
+      compress:
+        encodings:
+          - zstd
+          - br
+          - gzip
+        defaultEncoding: br
+        minResponseBodyBytes: 1024
+        excludedContentTypes:
+          - image/jpeg
+          - image/png
+          - image/gif
+          - image/webp
+          - image/avif
+          - video/mp4
+          - video/webm
+          - application/pdf
+          - application/zip
+          - application/gzip
+          - application/x-gzip
+FRAGEOF
+        # Merge profond : ajoute uniquement « compression », préserve les autres
+        # middlewares (redirect-to-https, addprefix générés par Dokploy, etc.).
+        yq -i eval-all '. as $item ireduce ({}; . * $item)' "$mconf" "$frag"
+        rm -f "$frag"
+        changed=1
+        ok "Middleware « compression » ajouté à dynamic/middlewares.yml."
+    else
+        info "Middleware « compression » déjà présent."
+    fi
+
+    # Sauvegarde de traefik.yml avant toute modification (une seule fois),
+    # uniquement si un patch est réellement nécessaire.
+    local tconf_needs_patch=0
+    [[ "$(yq '.entryPoints.websecure.http3.advertisedPort // "null"' "$tconf")" == "null" ]] && tconf_needs_patch=1
+    if ! yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" | grep -qx 'compression@file'; then
+        tconf_needs_patch=1
+    fi
+    [[ "$tconf_needs_patch" -eq 1 ]] && cp -a "$tconf" "${tconf}.bak-${stamp}"
+
+    # --- 2. traefik.yml : HTTP/3 sur websecure ---
+    if [[ "$(yq '.entryPoints.websecure.http3.advertisedPort // "null"' "$tconf")" == "null" ]]; then
+        yq -i '.entryPoints.websecure.http3.advertisedPort = 443' "$tconf"
+        changed=1
+        ok "HTTP/3 activé sur l'entrypoint websecure."
+    else
+        info "HTTP/3 déjà activé."
+    fi
+
+    # --- 3. traefik.yml : attacher compression@file en middleware global websecure ---
+    if ! yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" \
+            | grep -qx 'compression@file'; then
+        yq -i '.entryPoints.websecure.http.middlewares += ["compression@file"]' "$tconf"
+        changed=1
+        ok "Middleware compression@file attaché à websecure."
+    else
+        info "Middleware compression@file déjà attaché."
+    fi
+
+    # HTTP/3 = QUIC sur UDP/443 : s'assurer que le pare-feu laisse passer l'UDP
+    # (utile si cette commande est lancée sur un serveur provisionné avant l'ajout
+    # de la règle UDP/443 dans step_ufw_base). ufw allow est idempotent.
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        if ! ufw status 2>/dev/null | grep -qE '443/udp'; then
+            ufw allow 443/udp comment 'HTTP/3 QUIC' >/dev/null 2>&1 \
+                && ok "Port UDP/443 ouvert dans UFW (QUIC/HTTP-3)." \
+                || warn "Impossible d'ouvrir UDP/443 dans UFW — à vérifier manuellement."
+        else
+            info "Port UDP/443 déjà ouvert dans UFW."
+        fi
+    fi
+
+    # --- 4. rechargement ---
+    if [[ "$changed" -eq 1 ]]; then
+        if docker service ls --format '{{.Name}}' 2>/dev/null | grep -q '^dokploy-traefik$'; then
+            if docker service update --force dokploy-traefik >/dev/null 2>&1; then
+                ok "Service Traefik rechargé (config statique appliquée)."
+            else
+                warn "Rechargement Traefik échoué — relance : docker service update --force dokploy-traefik"
+            fi
+        else
+            warn "Service dokploy-traefik introuvable — redémarre Traefik pour appliquer HTTP/3."
+        fi
+    else
+        info "Configuration Traefik déjà optimale, aucun changement."
+    fi
+}
+
 cmd_check() {
     local pass=0 fail=0
 
@@ -1071,6 +1196,26 @@ cmd_check() {
         chk_fail "Rotation des logs Docker non configurée (/etc/docker/daemon.json absent ou sans max-size)"; fail=$((fail+1))
     fi
 
+    chk_sect "Traefik (HTTP/3 + compression)"
+    local tconf="/etc/dokploy/traefik/traefik.yml"
+    if [[ ! -f "$tconf" ]]; then
+        chk_info "Traefik/Dokploy non installé"
+    elif ! command -v yq >/dev/null 2>&1; then
+        chk_info "yq absent — état non vérifiable (« vps-helper traefik-tuning » l'installe)"
+    else
+        if [[ "$(yq '.entryPoints.websecure.http3.advertisedPort // "null"' "$tconf")" != "null" ]]; then
+            chk_pass "HTTP/3 activé sur websecure"; pass=$((pass+1))
+        else
+            chk_fail "HTTP/3 non activé (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
+        fi
+        if yq '.entryPoints.websecure.http.middlewares // [] | .[]' "$tconf" 2>/dev/null \
+                | grep -qx 'compression@file'; then
+            chk_pass "Middleware compression attaché à websecure"; pass=$((pass+1))
+        else
+            chk_fail "Compression non attachée (corriger : vps-helper traefik-tuning)"; fail=$((fail+1))
+        fi
+    fi
+
     chk_sect "Mises à jour automatiques"
     if systemctl is-active --quiet unattended-upgrades 2>/dev/null; then
         chk_pass "unattended-upgrades actif"; pass=$((pass+1))
@@ -1116,6 +1261,7 @@ case "$CMD" in
     logs)           shift; cmd_logs "$@" ;;
     update)         cmd_update ;;
     check)          cmd_check ;;
+    traefik-tuning) cmd_traefik_tuning ;;
     version)        cmd_version ;;
     help|--help|-h) print_help ;;
     *)
@@ -1199,6 +1345,28 @@ step_dokploy() {
     usermod -aG docker "$ADMIN_USER"
     SERVER_IP=$(curl -s -4 --max-time 3 ifconfig.me || echo "${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}")
     log_ok "Dokploy installé."
+}
+
+###############################################################################
+# 17. OPTIMISATION TRAEFIK (HTTP/3 + compression) — patch idempotent
+#
+# Active HTTP/3 et une compression Brotli/Zstd/gzip sur la config Traefik gérée
+# par Dokploy. La logique réelle vit dans vps-helper (cmd_traefik_tuning) : on
+# la réutilise ici pour éviter toute duplication. vps-helper est déjà installé
+# à ce stade (step_vps_helper s'exécute avant step_dokploy).
+###############################################################################
+step_traefik_tuning() {
+    log_step "Optimisation Traefik (HTTP/3 + compression Brotli/Zstd)"
+    if [[ ! -f /etc/dokploy/traefik/traefik.yml ]]; then
+        log_warn "traefik.yml introuvable (Dokploy non installé ?) — étape ignorée."
+        return
+    fi
+    if [[ -x /usr/local/bin/vps-helper ]]; then
+        /usr/local/bin/vps-helper traefik-tuning \
+            || log_warn "Optimisation Traefik incomplète (voir les messages ci-dessus)."
+    else
+        log_warn "vps-helper introuvable — optimisation Traefik ignorée."
+    fi
 }
 
 ###############################################################################
@@ -1322,6 +1490,7 @@ main() {
     step_vps_helper
     step_docker_log_limits
     step_dokploy
+    step_traefik_tuning
 
     print_summary
     notify_webhook

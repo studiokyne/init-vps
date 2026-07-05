@@ -11,6 +11,19 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
 
 Les deux heredocs utilisent des délimiteurs **entre guillemets simples** (`<<'MOTDEOF'`, `<<'HELPEREOF'`), ce qui signifie qu'aucune variable du script parent n'est interpolée à l'intérieur — à l'exception de `SCRIPT_VERSION` dans `HELPEREOF`, injectée via un `sed -i` après l'écriture du fichier.
 
+### Heredoc imbriqué `FRAGEOF` dans `HELPEREOF`
+
+`cmd_traefik_tuning` (dans vps-helper) contient un **heredoc imbriqué** délimité par `FRAGEOF` : le YAML du middleware `compression` est écrit dans un fichier temporaire, puis fusionné dans `middlewares.yml` via `yq`. Ce bloc `FRAGEOF` est du texte littéral pour le `cat` parent (`HELPEREOF`) ; il n'est interprété qu'à l'exécution de vps-helper sur le serveur. **Ne jamais renommer `FRAGEOF` en `HELPEREOF`** (collision de délimiteurs).
+
+### Étape 17 — Optimisation Traefik (déléguée à vps-helper)
+
+`step_traefik_tuning()` (script parent) ne contient **aucune logique** : elle délègue à `vps-helper traefik-tuning`. C'est possible car `step_vps_helper` s'exécute **avant** `step_dokploy`/`step_traefik_tuning`, donc le binaire existe déjà. Toute la logique réelle (patch `yq` idempotent de `traefik.yml` + `dynamic/middlewares.yml`, backups horodatés, ouverture UFW UDP/443, rechargement `docker service update --force dokploy-traefik`) vit dans `cmd_traefik_tuning`. **Ne pas dupliquer cette logique dans le parent.**
+
+Points clés :
+- Le middleware s'appelle `compression` (référencé `compression@file`) — nom neutre, sans préfixe `sk-`.
+- HTTP/3 = QUIC sur **UDP/443** : `step_ufw_base` ouvre `443/udp`, et `cmd_traefik_tuning` le garantit aussi (cas d'un serveur provisionné avant l'ajout de cette règle).
+- Le patch utilise `yq` (mikefarah, téléchargé si absent) et un merge profond (`eval-all ... ireduce`) pour **préserver** les middlewares gérés par Dokploy (`redirect-to-https`, `addprefix-*`, etc.). Jamais de réécriture destructive.
+
 ---
 
 ## Conventions de code
@@ -140,4 +153,10 @@ Déclenché sur push de tag `v*.*.*` (créé par release-please ou manuellement)
 - La constante `SCRIPT_VERSION="0.0.0-dev"` est présente dans le script source sur `main`.
 - Un push sur `main` calcule automatiquement la version `YYYY.MM.DD.N` et la substitue dans la copie publiée.
 - La version est incluse dans le résumé final (`print_summary()`) et dans le log `/var/log/init-vps.log`.
+
+---
+
+## Tester le heredoc imbriqué `FRAGEOF`
+
+L'extraction du heredoc vps-helper (voir plus haut) inclut automatiquement le bloc `FRAGEOF`, puisqu'il fait partie du corps de `HELPEREOF`. Un `bash -n` sur `helper_check.sh` valide donc aussi la syntaxe de `cmd_traefik_tuning` et de son heredoc imbriqué.
 - Sur le serveur, `vps-helper version` affiche la version de `init-vps.sh` utilisée pour l'initialisation (via `INIT_VPS_VERSION` dans vps-helper, injectée par `sed -i` lors de l'étape 14).
