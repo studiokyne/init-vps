@@ -8,12 +8,23 @@
 #   curl -fsSL <URL_RAW_GITHUB>/init-vps.sh -o init-vps.sh \
 #     && chmod +x init-vps.sh && sudo ./init-vps.sh
 #
+# MODE MISE À JOUR :
+#   Une fois exécuté une première fois, le script sauvegarde sa configuration
+#   dans /etc/init-vps/config.env. En relançant le script sur ce même serveur
+#   (nouvelle version téléchargée, nouvelles fonctionnalités...), il détecte
+#   ce fichier et propose un « mode mise à jour » : aucune question reposée,
+#   la config est rechargée et toutes les étapes (idempotentes) sont rejouées
+#   — ce qui applique automatiquement les changements (MOTD, vps-helper,
+#   durcissement, etc.) sans tout réinitialiser. Forçable avec :
+#     sudo ./init-vps.sh --update
+#
 # Le script pose toutes les questions nécessaires au fur et à mesure, avec
 # une valeur par défaut entre crochets quand il y en a une (Entrée pour
 # l'accepter). Chaque saisie est validée pour éviter les typos.
 #
 # Étapes :
-#   0. Collecte interactive de la configuration + récapitulatif + confirmation
+#   0. Collecte interactive de la configuration (dont le rôle du serveur —
+#      manager Dokploy ou remote server) + récapitulatif + confirmation
 #   1. Mise à jour du système
 #   2. Définition du hostname
 #   3. Création du compte admin (sudo) + clé(s) SSH
@@ -29,10 +40,13 @@
 #  11. Swap (taille recommandée selon la RAM détectée, ajustable)
 #  12. Fuseau horaire / NTP / limites des logs journald
 #  13. MOTD personnalisé (design uniforme à la connexion SSH)
-#  14. Commande d'aide vps-helper (whitelist, restart, logs, update...)
+#  14. Commande d'aide vps-helper (whitelist, ssh-keys, restart, logs, update...)
 #  15. Limitation des logs Docker (rotation 10 Mo x 3 par conteneur)
-#  16. Installation de Dokploy
+#  16. Installation de Dokploy — uniquement si rôle = manager
 #  17. Optimisation Traefik (HTTP/3 + compression Brotli/Zstd, patch idempotent)
+#      — uniquement si rôle = manager
+#  18. Sauvegarde de la configuration (/etc/init-vps/config.env), pour permettre
+#      une future relance en mode mise à jour
 #
 # Résumé final + prochaines étapes, affiché et sauvegardé dans un fichier.
 #
@@ -50,6 +64,8 @@ SSH_PORT=22
 SCRIPT_VERSION="0.0.0-dev"
 LOG_FILE="/var/log/init-vps.log"
 SSHD_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
+STATE_DIR="/etc/init-vps"
+STATE_FILE="${STATE_DIR}/config.env"
 
 # Variables collectées de façon interactive (valeurs par défaut ci-dessous)
 SERVER_HOSTNAME=""
@@ -59,6 +75,8 @@ TIMEZONE=""
 SWAP_SIZE_GB=0
 DOKPLOY_RESTRICT_IP=""
 ADVERTISE_ADDR=""
+SERVER_ROLE=""
+DOKPLOY_PORT_CLOSED=""
 PASSWORD_FILE=""
 SERVER_IP=""
 SUMMARY_FILE=""
@@ -186,6 +204,10 @@ validate_hostname_part() {
     [[ "$v" =~ ^[a-z0-9]{1,20}$ ]]
 }
 
+# NOTE : dupliquée à l'identique dans HELPEREOF (voir validate_ssh_pubkey()
+# dans vps-helper, utilisée par `ssh-keys add`) — les heredocs sont en
+# guillemets simples, aucune fonction ne peut être partagée entre ce script
+# et vps-helper. Garder les deux regex synchronisées en cas de modification.
 validate_ssh_pubkey() {
     local key="$1"
     [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
@@ -197,6 +219,10 @@ validate_timezone() {
 
 validate_nonneg_int() {
     [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_server_role() {
+    [[ "$1" =~ ^[12]$ ]]
 }
 
 validate_ip_cidr() {
@@ -351,6 +377,15 @@ collect_swap() {
     prompt SWAP_SIZE_GB "Taille du swap à créer en Go (0 pour ne pas en créer)" "$recommended" validate_nonneg_int
 }
 
+collect_server_role() {
+    log_step "Rôle de ce serveur"
+    log_info "1) Manager Dokploy — panel central, héberge Dokploy + Traefik sur ce serveur."
+    log_info "2) Remote server — géré à distance par un manager Dokploy existant (ajouté ensuite via Dokploy → Settings → Servers → Add Server)."
+    local role="${SERVER_ROLE:-1}"
+    prompt role "Rôle de ce serveur (1 ou 2)" "$role" validate_server_role
+    SERVER_ROLE="$role"
+}
+
 collect_dokploy_restrict_ip() {
     log_step "Accès à l'interface Dokploy (port 3000)"
     log_info "Le port 3000 sera ouvert, le temps de configurer un nom de domaine + TLS dans Dokploy (fermeture manuelle ensuite)."
@@ -385,22 +420,42 @@ collect_timezone() {
 
 show_recap() {
     log_step "Récapitulatif avant exécution"
-    local swap_line dokploy_line advertise_line
+    local swap_line dokploy_line advertise_line role_line
     [[ "$SWAP_SIZE_GB" -eq 0 ]] && swap_line="aucun" || swap_line="${SWAP_SIZE_GB} Go"
-    [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="ouvert temporairement à tous"
-    [[ -n "$ADVERTISE_ADDR" ]] && advertise_line="${ADVERTISE_ADDR}" || advertise_line="auto-détection (Dokploy)"
+    [[ "$SERVER_ROLE" == "1" ]] && role_line="Manager Dokploy" || role_line="Remote server (géré à distance)"
 
-    cat <<EOF
-  Hostname                  : ${SERVER_HOSTNAME}
-  Compte admin              : ${ADMIN_USER}
-  Clé(s) SSH                : ${#SSH_PUBLIC_KEYS[@]} clé(s) fournie(s)
-  Port SSH                  : ${SSH_PORT} (fixe)
-  Fuseau horaire             : ${TIMEZONE}
-  Swap                      : ${swap_line}
-  Accès Dokploy (port 3000) : ${dokploy_line}
-  Adresse Docker Swarm       : ${advertise_line}
-EOF
+    {
+        echo "  Hostname                  : ${SERVER_HOSTNAME}"
+        echo "  Compte admin              : ${ADMIN_USER}"
+        echo "  Clé(s) SSH                : ${#SSH_PUBLIC_KEYS[@]} clé(s) fournie(s)"
+        echo "  Port SSH                  : ${SSH_PORT} (fixe)"
+        echo "  Fuseau horaire             : ${TIMEZONE}"
+        echo "  Swap                      : ${swap_line}"
+        echo "  Rôle du serveur           : ${role_line}"
+        if [[ "$SERVER_ROLE" == "1" ]]; then
+            [[ -n "$DOKPLOY_RESTRICT_IP" ]] && dokploy_line="restreint à ${DOKPLOY_RESTRICT_IP}" || dokploy_line="ouvert temporairement à tous"
+            [[ -n "$ADVERTISE_ADDR" ]] && advertise_line="${ADVERTISE_ADDR}" || advertise_line="auto-détection (Dokploy)"
+            echo "  Accès Dokploy (port 3000) : ${dokploy_line}"
+            echo "  Adresse Docker Swarm       : ${advertise_line}"
+        fi
+    }
     echo ""
+}
+
+###############################################################################
+# HELPERS — exécution
+###############################################################################
+# Renseigne SERVER_IP indépendamment du rôle (Dokploy ou non), pour que
+# print_summary() et step_save_state() disposent toujours d'une IP correcte.
+# Reprend le repli IP locale de step_dokploy (hostname -I) : sans lui, un
+# échec transitoire de curl sur un rôle "remote" (qui n'a pas d'ADVERTISE_ADDR
+# collecté) affichait littéralement le texte "<IP_DU_SERVEUR>" dans le résumé.
+detect_server_ip() {
+    SERVER_IP=$(curl -s -4 --max-time 3 ifconfig.me || true)
+    if [[ -z "$SERVER_IP" ]]; then
+        SERVER_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | head -n1 || true)
+    fi
+    [[ -z "$SERVER_IP" ]] && SERVER_IP="${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}"
 }
 
 ###############################################################################
@@ -437,7 +492,7 @@ step_hostname() {
 step_create_admin() {
     log_step "Création du compte admin"
     if id "$ADMIN_USER" &>/dev/null; then
-        log_warn "L'utilisateur ${ADMIN_USER} existe déjà, création de compte ignorée (clés SSH mises à jour quand même)."
+        log_info "L'utilisateur ${ADMIN_USER} existe déjà, création de compte ignorée."
     else
         local group_opt=()
         if getent group "$ADMIN_USER" &>/dev/null; then
@@ -458,13 +513,20 @@ step_create_admin() {
 
     install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "/home/${ADMIN_USER}/.ssh"
     local authorized_keys="/home/${ADMIN_USER}/.ssh/authorized_keys"
-    backup_file "$authorized_keys"
-    { [[ -f "$authorized_keys" ]] && cat "$authorized_keys"; printf '%s\n' "${SSH_PUBLIC_KEYS[@]}"; } \
-        | awk 'NF && !seen[$0]++' > "${authorized_keys}.tmp"
-    mv "${authorized_keys}.tmp" "$authorized_keys"
-    chmod 600 "$authorized_keys"
-    chown "${ADMIN_USER}:${ADMIN_USER}" "$authorized_keys"
-    log_ok "${#SSH_PUBLIC_KEYS[@]} clé(s) SSH installée(s) pour ${ADMIN_USER}."
+    # En mode mise à jour, SSH_PUBLIC_KEYS est vide (gestion déléguée à
+    # `vps-helper ssh-keys`) : pas de nouvelle clé à fusionner, on laisse
+    # authorized_keys intact plutôt que de le réécrire pour rien à chaque run.
+    if [[ "${#SSH_PUBLIC_KEYS[@]}" -gt 0 ]]; then
+        backup_file "$authorized_keys"
+        { [[ -f "$authorized_keys" ]] && cat "$authorized_keys"; printf '%s\n' "${SSH_PUBLIC_KEYS[@]}"; } \
+            | awk 'NF && !seen[$0]++' > "${authorized_keys}.tmp"
+        mv "${authorized_keys}.tmp" "$authorized_keys"
+        chmod 600 "$authorized_keys"
+        chown "${ADMIN_USER}:${ADMIN_USER}" "$authorized_keys"
+        log_ok "${#SSH_PUBLIC_KEYS[@]} clé(s) SSH fournie(s) fusionnée(s) dans authorized_keys pour ${ADMIN_USER}."
+    else
+        log_info "Aucune nouvelle clé SSH à fusionner (gestion : vps-helper ssh-keys)."
+    fi
 }
 
 ###############################################################################
@@ -472,6 +534,13 @@ step_create_admin() {
 ###############################################################################
 step_fail2ban() {
     log_step "Configuration de fail2ban"
+    # Préserve la liste blanche (ignoreip) éventuellement ajoutée via
+    # `vps-helper whitelist` avant de régénérer le fichier — sinon une
+    # relance du script (mode mise à jour) l'effacerait silencieusement.
+    local existing_ignoreip=""
+    if [[ -f /etc/fail2ban/jail.local ]]; then
+        existing_ignoreip="$(grep '^ignoreip' /etc/fail2ban/jail.local 2>/dev/null || true)"
+    fi
     backup_file /etc/fail2ban/jail.local
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -479,6 +548,12 @@ bantime  = 1h
 findtime = 10m
 maxretry = 4
 backend  = systemd
+EOF
+    if [[ -n "$existing_ignoreip" ]]; then
+        echo "$existing_ignoreip" >> /etc/fail2ban/jail.local
+        log_info "Liste blanche fail2ban existante conservée."
+    fi
+    cat >> /etc/fail2ban/jail.local <<EOF
 
 [sshd]
 enabled  = true
@@ -552,7 +627,16 @@ step_ufw_base() {
         attempts=$((attempts+1))
     done
 
-    if [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
+    # Le port 3000 (UI Dokploy) n'a de sens que pour un rôle manager, et
+    # seulement tant qu'il n'a pas été fermé manuellement (`vps-helper
+    # close-dokploy`, qui persiste ce choix dans $STATE_FILE) : sans ces deux
+    # gardes, un rôle remote se retrouvait avec 3000/tcp ouvert pour rien, et
+    # une relance en mode mise à jour rouvrait un port fermé exprès.
+    if [[ "$SERVER_ROLE" != "1" ]]; then
+        log_info "Rôle 'remote server' : port 3000 (Dokploy) non ouvert, non applicable."
+    elif [[ "$DOKPLOY_PORT_CLOSED" == "1" ]]; then
+        log_info "Port 3000 laissé fermé (fermé précédemment via « vps-helper close-dokploy »)."
+    elif [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
         ufw allow from "$DOKPLOY_RESTRICT_IP" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
     else
         ufw allow 3000/tcp comment 'Dokploy UI - a fermer manuellement apres config domaine' >/dev/null
@@ -891,6 +975,7 @@ set -uo pipefail
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
 INIT_VPS_VERSION="0.0.0-dev"
+DEFAULT_ADMIN_USER=""
 
 info() { echo -e "${C_DIM}[i]${C_RESET} $*"; }
 ok()   { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
@@ -902,7 +987,7 @@ chk_fail() { printf '%b %s\n' "${C_RED}[FAIL]${C_RESET}" "$1"; }
 chk_info() { printf '%b %s\n' "${C_CYAN}[INFO]${C_RESET}" "$1"; }
 chk_sect() { printf '\n%b%s%b\n' "${C_DIM}── " "$1" " ────────────────────────────────────────${C_RESET}"; }
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning"
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -920,6 +1005,9 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper whitelist <IP>${C_RESET}      Ajouter une IP de confiance (jamais bannie par fail2ban)
   ${C_CYAN}vps-helper unban <IP>${C_RESET}          Débannir une IP bannie par fail2ban
   ${C_CYAN}vps-helper close-dokploy${C_RESET}       Fermer l'accès direct au port 3000 (Dokploy)
+  ${C_CYAN}vps-helper ssh-keys list [user]${C_RESET}    Lister les clés SSH d'un utilisateur (défaut : compte admin)
+  ${C_CYAN}vps-helper ssh-keys add [user]${C_RESET}     Ajouter une clé SSH (invite à la coller)
+  ${C_CYAN}vps-helper ssh-keys remove [user]${C_RESET}  Supprimer une clé SSH (choix dans une liste numérotée)
   ${C_CYAN}vps-helper restart <service>${C_RESET}   Redémarrer un service : ssh, fail2ban, docker
   ${C_CYAN}vps-helper logs <conteneur>${C_RESET}    Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter)
   ${C_CYAN}vps-helper update${C_RESET}              Mettre à jour le système (sécurité incluse)
@@ -977,6 +1065,144 @@ cmd_unban() {
     fi
 }
 
+# --- Gestion interactive des clés SSH -------------------------------------
+# NOTE : dupliquée à l'identique depuis validate_ssh_pubkey() dans le script
+# parent (collect_ssh_keys) — heredoc en guillemets simples, impossible de
+# partager la fonction. Garder les deux regex synchronisées en cas de modif.
+validate_ssh_pubkey() {
+    local key="$1"
+    [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
+}
+
+# Résout et valide l'utilisateur cible. Écrit le nom sur stdout (à capturer
+# via $(...)) et retourne un code d'erreur si invalide — ne jamais faire
+# `exit` ici : sous $(...) ça ne quitterait qu'un sous-shell, pas le script.
+resolve_ssh_user() {
+    local u="${1:-$DEFAULT_ADMIN_USER}"
+    if [[ -z "$u" ]]; then
+        err "Aucun utilisateur cible. Usage : vps-helper ssh-keys <list|add|remove> [utilisateur]"
+        return 1
+    fi
+    if ! id "$u" &>/dev/null; then
+        err "Utilisateur « ${u} » introuvable."
+        return 1
+    fi
+    printf '%s' "$u"
+}
+
+ssh_keys_file() {
+    local home_dir
+    home_dir="$(getent passwd "$1" | cut -d: -f6)"
+    printf '%s/.ssh/authorized_keys' "$home_dir"
+}
+
+# Lit authorized_keys dans le tableau global SSH_KEYS_LINES (ignore lignes
+# vides/commentaires). Utilisé par list et remove pour partager le même
+# affichage numéroté.
+load_ssh_keys_lines() {
+    SSH_KEYS_LINES=()
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        SSH_KEYS_LINES+=("$line")
+    done < "$1"
+}
+
+print_ssh_keys_lines() {
+    local i keytype comment
+    for i in "${!SSH_KEYS_LINES[@]}"; do
+        keytype=$(awk '{print $1}' <<< "${SSH_KEYS_LINES[$i]}")
+        comment=$(awk '{for (j=3;j<=NF;j++) printf "%s ", $j}' <<< "${SSH_KEYS_LINES[$i]}")
+        printf '  %b%2d)%b %-20s %s\n' "${C_CYAN}" "$((i+1))" "${C_RESET}" "$keytype" "${comment:-<sans commentaire>}"
+    done
+}
+
+cmd_ssh_keys_list() {
+    local user; user="$(resolve_ssh_user "${1:-}")" || exit 1
+    local file; file="$(ssh_keys_file "$user")"
+    if [[ ! -s "$file" ]]; then
+        info "Aucune clé SSH pour ${user}."
+        return
+    fi
+    local SSH_KEYS_LINES=()
+    load_ssh_keys_lines "$file"
+    info "Clés SSH de ${user} (${file}) :"
+    print_ssh_keys_lines
+}
+
+cmd_ssh_keys_add() {
+    local user; user="$(resolve_ssh_user "${1:-}")" || exit 1
+    local file; file="$(ssh_keys_file "$user")"
+    local key
+    read -rp "Coller la clé publique SSH à ajouter pour ${user} : " key
+    if ! validate_ssh_pubkey "$key"; then
+        err "Format de clé SSH invalide (attendu : ssh-ed25519/ssh-rsa/ecdsa-... suivi de la clé)."
+        exit 1
+    fi
+    install -d -m 700 -o "$user" -g "$user" "$(dirname "$file")"
+    touch "$file"
+    if grep -qxF "$key" "$file" 2>/dev/null; then
+        info "Cette clé est déjà présente pour ${user}."
+        return
+    fi
+    cp -a "$file" "${file}.bak-$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    echo "$key" >> "$file"
+    chmod 600 "$file"
+    chown "${user}:${user}" "$file" 2>/dev/null || true
+    ok "Clé SSH ajoutée pour ${user}."
+}
+
+cmd_ssh_keys_remove() {
+    local user; user="$(resolve_ssh_user "${1:-}")" || exit 1
+    local file; file="$(ssh_keys_file "$user")"
+    if [[ ! -s "$file" ]]; then
+        info "Aucune clé SSH pour ${user}."
+        return
+    fi
+    local SSH_KEYS_LINES=()
+    load_ssh_keys_lines "$file"
+    if [[ "${#SSH_KEYS_LINES[@]}" -le 1 ]]; then
+        err "Une seule clé restante pour ${user} — suppression refusée (risque de perte d'accès SSH)."
+        exit 1
+    fi
+    info "Clés SSH de ${user} :"
+    print_ssh_keys_lines
+    local choice
+    read -rp "Numéro de la clé à supprimer (Ctrl+C pour annuler) : " choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#SSH_KEYS_LINES[@]} )); then
+        err "Choix invalide."
+        exit 1
+    fi
+    local removed="${SSH_KEYS_LINES[$((choice-1))]}"
+    local confirm_input
+    read -rp "$(printf '%b' "${C_YELLOW}?${C_RESET} Supprimer la clé #${choice} (${removed:0:50}...) ? [o/N] : ")" confirm_input
+    if ! [[ "${confirm_input,,}" =~ ^(o|oui|y|yes)$ ]]; then
+        info "Annulé."
+        return
+    fi
+    cp -a "$file" "${file}.bak-$(date +%Y%m%d%H%M%S)"
+    unset 'SSH_KEYS_LINES[choice-1]'
+    printf '%s\n' "${SSH_KEYS_LINES[@]}" > "${file}.tmp"
+    mv "${file}.tmp" "$file"
+    chmod 600 "$file"
+    chown "${user}:${user}" "$file" 2>/dev/null || true
+    ok "Clé SSH supprimée pour ${user}."
+}
+
+cmd_ssh_keys() {
+    local sub="${1:-list}"
+    [[ $# -gt 0 ]] && shift
+    case "$sub" in
+        list)             cmd_ssh_keys_list "$@" ;;
+        add)              cmd_ssh_keys_add "$@" ;;
+        remove|rm|delete) cmd_ssh_keys_remove "$@" ;;
+        *)
+            err "Sous-commande inconnue : « ${sub} ». Utiliser : list, add, remove."
+            exit 1
+            ;;
+    esac
+}
+
 cmd_close_dokploy() {
     local attempts=0 rule_num found=0
     while ufw status numbered | grep -q '3000/tcp' && (( attempts < 10 )); do
@@ -990,6 +1216,18 @@ cmd_close_dokploy() {
         ok "Port 3000 fermé. Désactivation de l'accès direct via IP:port recommandée dans les réglages Dokploy."
     else
         info "Aucune règle ouverte sur le port 3000, rien à fermer."
+    fi
+
+    # Persiste le choix dans l'état sauvegardé par init-vps.sh, pour qu'une
+    # relance ultérieure en mode mise à jour (`init-vps.sh --update`) ne
+    # rouvre pas ce port automatiquement via step_ufw_base.
+    local state_file="/etc/init-vps/config.env"
+    if [[ -f "$state_file" ]]; then
+        if grep -q '^DOKPLOY_PORT_CLOSED=' "$state_file" 2>/dev/null; then
+            sed -i 's/^DOKPLOY_PORT_CLOSED=.*/DOKPLOY_PORT_CLOSED="1"/' "$state_file"
+        else
+            echo 'DOKPLOY_PORT_CLOSED="1"' >> "$state_file"
+        fi
     fi
 }
 
@@ -1301,6 +1539,7 @@ case "$CMD" in
     whitelist)      shift; cmd_whitelist "$@" ;;
     unban)          shift; cmd_unban "$@" ;;
     close-dokploy)  cmd_close_dokploy ;;
+    ssh-keys)       shift; cmd_ssh_keys "$@" ;;
     restart)        shift; cmd_restart "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
     update)         cmd_update ;;
@@ -1316,6 +1555,7 @@ case "$CMD" in
 esac
 HELPEREOF
     sed -i "s/^INIT_VPS_VERSION=.*/INIT_VPS_VERSION=\"${SCRIPT_VERSION}\"/" /usr/local/bin/vps-helper
+    sed -i "s/^DEFAULT_ADMIN_USER=.*/DEFAULT_ADMIN_USER=\"${ADMIN_USER}\"/" /usr/local/bin/vps-helper
     chmod +x /usr/local/bin/vps-helper
     log_ok "Commande vps-helper installée (vps-helper help pour la liste des commandes)."
 }
@@ -1368,36 +1608,42 @@ EOF
 ensure_docker() {
     if command -v docker &>/dev/null; then
         log_info "Docker déjà présent, pré-installation ignorée."
-        return
+    else
+        log_info "Pré-installation de Docker (avant Dokploy)..."
+
+        local id codename
+        id="$( . /etc/os-release; echo "${ID:-ubuntu}" )"
+        codename="$( . /etc/os-release; echo "${VERSION_CODENAME:-}" )"
+        [[ "$id" == "ubuntu" || "$id" == "debian" ]] || id="ubuntu"
+
+        local repo_base="https://download.docker.com/linux/${id}"
+        if [[ -z "$codename" ]] || ! curl -fsSL "${repo_base}/dists/${codename}/Release" >/dev/null 2>&1; then
+            local fallback
+            if [[ "$id" == "debian" ]]; then fallback="bookworm"; else fallback="noble"; fi
+            log_warn "Dépôt Docker indisponible pour « ${codename:-inconnu} », repli sur « ${fallback} »."
+            codename="$fallback"
+        fi
+
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL "${repo_base}/gpg" -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${repo_base} ${codename} stable" \
+            > /etc/apt/sources.list.d/docker.list
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+
+        if ! command -v docker &>/dev/null; then
+            error "Échec de l'installation de Docker (dépôt ${id}/${codename}). Dokploy ne peut pas être installé."
+        fi
+        log_ok "Docker installé (dépôt ${id}/${codename})."
     fi
-    log_info "Pré-installation de Docker (avant Dokploy)..."
 
-    local id codename
-    id="$( . /etc/os-release; echo "${ID:-ubuntu}" )"
-    codename="$( . /etc/os-release; echo "${VERSION_CODENAME:-}" )"
-    [[ "$id" == "ubuntu" || "$id" == "debian" ]] || id="ubuntu"
-
-    local repo_base="https://download.docker.com/linux/${id}"
-    if [[ -z "$codename" ]] || ! curl -fsSL "${repo_base}/dists/${codename}/Release" >/dev/null 2>&1; then
-        local fallback
-        if [[ "$id" == "debian" ]]; then fallback="bookworm"; else fallback="noble"; fi
-        log_warn "Dépôt Docker indisponible pour « ${codename:-inconnu} », repli sur « ${fallback} »."
-        codename="$fallback"
-    fi
-
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "${repo_base}/gpg" -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] ${repo_base} ${codename} stable" \
-        > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
-
-    if ! command -v docker &>/dev/null; then
-        error "Échec de l'installation de Docker (dépôt ${id}/${codename}). Dokploy ne peut pas être installé."
-    fi
-    log_ok "Docker installé (dépôt ${id}/${codename})."
+    # Nécessaire ici (et pas seulement dans step_dokploy) : sur un serveur
+    # « remote », ensure_docker est le SEUL point d'entrée Docker (step_dokploy
+    # n'est jamais appelée), donc c'est ici qu'il faut garantir l'accès docker
+    # sans sudo pour l'admin, sous peine de laisser ce rôle sans ce confort.
+    usermod -aG docker "$ADMIN_USER" 2>/dev/null || true
 }
 
 step_dokploy() {
@@ -1406,7 +1652,7 @@ step_dokploy() {
     if command -v docker &>/dev/null && docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q '^active$'; then
         log_warn "Docker Swarm déjà actif sur ce serveur — Dokploy semble déjà installé, étape ignorée."
         usermod -aG docker "$ADMIN_USER" 2>/dev/null || true
-        SERVER_IP=$(curl -s -4 --max-time 3 ifconfig.me || echo "${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}")
+        detect_server_ip
         log_ok "Dokploy déjà présent, rien à réinstaller."
         return
     fi
@@ -1431,7 +1677,7 @@ step_dokploy() {
     curl -fsSL https://dokploy.com/install.sh | sh
 
     usermod -aG docker "$ADMIN_USER"
-    SERVER_IP=$(curl -s -4 --max-time 3 ifconfig.me || echo "${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}")
+    detect_server_ip
     log_ok "Dokploy installé."
 }
 
@@ -1458,6 +1704,33 @@ step_traefik_tuning() {
 }
 
 ###############################################################################
+# 18. SAUVEGARDE DE L'ÉTAT — pour le mode mise à jour (--update)
+###############################################################################
+# Persiste la configuration collectée pour permettre de relancer le script
+# plus tard en mode mise à jour (rejoue les steps idempotents sans reposer
+# les questions). Ne contient volontairement PAS les clés SSH : la gestion
+# des clés se fait ensuite via `vps-helper ssh-keys`, l'authorized_keys du
+# serveur reste la seule source de vérité.
+step_save_state() {
+    log_step "Sauvegarde de la configuration (pour les mises à jour futures)"
+    mkdir -p "$STATE_DIR"
+    cat > "$STATE_FILE" <<EOF
+SCRIPT_VERSION="${SCRIPT_VERSION}"
+SERVER_HOSTNAME="${SERVER_HOSTNAME}"
+ADMIN_USER="${ADMIN_USER}"
+TIMEZONE="${TIMEZONE}"
+SWAP_SIZE_GB="${SWAP_SIZE_GB}"
+DOKPLOY_RESTRICT_IP="${DOKPLOY_RESTRICT_IP}"
+ADVERTISE_ADDR="${ADVERTISE_ADDR}"
+SERVER_ROLE="${SERVER_ROLE}"
+DOKPLOY_PORT_CLOSED="${DOKPLOY_PORT_CLOSED}"
+LAST_RUN="$(date -Iseconds)"
+EOF
+    chmod 600 "$STATE_FILE"
+    log_ok "Configuration sauvegardée dans ${STATE_FILE} (réutilisée par le mode mise à jour)."
+}
+
+###############################################################################
 # RÉSUMÉ FINAL
 ###############################################################################
 # Vrai si un redémarrage est nécessaire : soit le drapeau posé par apt
@@ -1477,6 +1750,19 @@ print_summary() {
     # le fuseau horaire défini en cours de route (step_system_misc).
     SUMMARY_FILE="/root/init-vps-summary-$(date +%Y%m%d-%H%M%S).txt"
 
+    # Compte les clés SSH réellement installées sur disque plutôt que le
+    # tableau en mémoire : en mode mise à jour, SSH_PUBLIC_KEYS est vide
+    # (les clés sont gérées via `vps-helper ssh-keys`), l'authorized_keys
+    # du compte admin reste la seule source de vérité.
+    local key_count="" authorized_keys="/home/${ADMIN_USER}/.ssh/authorized_keys"
+    if [[ -f "$authorized_keys" ]]; then
+        # grep -c imprime "0" ET sort en erreur (1) quand rien ne matche : ne
+        # jamais mettre `|| echo 0` À L'INTÉRIEUR du $(...), ça concaténerait
+        # les deux sorties ("0" + "0") au lieu de se substituer proprement.
+        key_count=$(grep -c '^[^#[:space:]]' "$authorized_keys" 2>/dev/null || true)
+    fi
+    key_count="${key_count:-0}"
+
     {
         echo "════════════════════════════════════════════════════"
         echo " RÉSUMÉ — $(date '+%Y-%m-%d %H:%M:%S')"
@@ -1485,13 +1771,17 @@ print_summary() {
         echo "Hostname          : ${SERVER_HOSTNAME}"
         echo "Compte admin      : ${ADMIN_USER}"
         echo "Port SSH          : ${SSH_PORT}"
-        echo "Clé(s) SSH        : ${#SSH_PUBLIC_KEYS[@]} installée(s)"
+        echo "Clé(s) SSH        : ${key_count} installée(s) (gestion : vps-helper ssh-keys)"
         if [[ "$SWAP_SIZE_GB" -eq 0 ]]; then
             echo "Swap              : aucun (ou déjà présent)"
         else
             echo "Swap              : ${SWAP_SIZE_GB} Go"
         fi
-        echo "Dokploy           : http://${SERVER_IP}:3000"
+        if [[ "$SERVER_ROLE" == "1" ]]; then
+            echo "Dokploy           : http://${SERVER_IP}:3000"
+        else
+            echo "Rôle              : Remote server — prêt à être ajouté depuis Dokploy (Settings → Servers → Add Server)"
+        fi
         echo "Fichier log       : ${LOG_FILE}"
         [[ -f "$PASSWORD_FILE" ]] && echo "Mot de passe sudo : ${PASSWORD_FILE} (à supprimer une fois noté)"
         if reboot_is_pending; then
@@ -1500,25 +1790,39 @@ print_summary() {
         echo ""
         echo "PROCHAINES ÉTAPES"
         echo "──────────────────────────────────────────────────"
-        echo "1. Vérifier la connexion SSH depuis un nouveau terminal :"
+        local step_n=1
+        echo "${step_n}. Vérifier la connexion SSH depuis un nouveau terminal :"
         echo "     ssh ${ADMIN_USER}@${SERVER_IP}"
-        echo ""
-        echo "2. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
-        echo ""
-        echo "3. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
-        echo ""
-        echo "4. Une fois le domaine actif, fermer manuellement l'accès direct au port 3000 :"
-        if [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
-            echo "     ufw delete allow from ${DOKPLOY_RESTRICT_IP} to any port 3000 proto tcp"
+        step_n=$((step_n+1))
+        if [[ "$SERVER_ROLE" == "1" ]]; then
+            echo ""
+            echo "${step_n}. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
+            step_n=$((step_n+1))
+            echo ""
+            echo "${step_n}. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
+            step_n=$((step_n+1))
+            echo ""
+            echo "${step_n}. Une fois le domaine actif, fermer manuellement l'accès direct au port 3000 :"
+            if [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
+                echo "     ufw delete allow from ${DOKPLOY_RESTRICT_IP} to any port 3000 proto tcp"
+            else
+                echo "     ufw delete allow 3000/tcp"
+            fi
+            step_n=$((step_n+1))
+            echo ""
+            echo "${step_n}. Désactiver l'accès direct via ip:port dans les réglages Dokploy."
+            step_n=$((step_n+1))
         else
-            echo "     ufw delete allow 3000/tcp"
+            echo ""
+            echo "${step_n}. Ajouter ce serveur depuis le manager Dokploy : Settings → Servers → Add Server"
+            echo "     IP : ${SERVER_IP} · Port SSH : ${SSH_PORT} · Utilisateur : ${ADMIN_USER}"
+            step_n=$((step_n+1))
         fi
-        echo ""
-        echo "5. Désactiver l'accès direct via ip:port dans les réglages Dokploy."
         if [[ -f "$PASSWORD_FILE" ]]; then
             echo ""
-            echo "6. Supprimer le fichier mot de passe une fois noté :"
+            echo "${step_n}. Supprimer le fichier mot de passe une fois noté :"
             echo "     shred -u ${PASSWORD_FILE}"
+            step_n=$((step_n+1))
         fi
         if reboot_is_pending; then
             echo ""
@@ -1557,19 +1861,67 @@ main() {
     print_banner
     detect_os
 
-    collect_hostname
-    collect_admin_user
-    collect_ssh_keys
-    collect_timezone
-    collect_swap
-    collect_dokploy_restrict_ip
-    collect_advertise_addr
-    show_recap
+    # --- Mode mise à jour -----------------------------------------------
+    # Une exécution précédente laisse un état sauvegardé (${STATE_FILE}).
+    # On le détecte pour proposer de rejouer les steps idempotentes (MOTD,
+    # vps-helper, durcissement...) sans reposer les questions. `--update`
+    # force ce mode explicitement (utile en non-interactif).
+    local update_mode=0
+    [[ "${1:-}" == "--update" ]] && update_mode=1
 
-    confirm "Lancer l'initialisation avec ces paramètres ?" "o" \
-        || { log_warn "Annulé par l'utilisateur."; exit 0; }
+    if [[ -f "$STATE_FILE" ]]; then
+        if [[ "$update_mode" -eq 0 ]]; then
+            log_info "Configuration existante détectée (${STATE_FILE}, exécution précédente du script)."
+            confirm "Lancer en mode mise à jour (réapplique MOTD, vps-helper, durcissement... sans reposer les questions) ?" "o" \
+                && update_mode=1
+        fi
+    elif [[ "$update_mode" -eq 1 ]]; then
+        error "Mode mise à jour demandé (--update) mais aucune configuration sauvegardée trouvée (${STATE_FILE}). Lancer d'abord une installation complète (sans --update)."
+    fi
 
-    step_update_system
+    if [[ "$update_mode" -eq 1 ]]; then
+        # $STATE_FILE contient un SCRIPT_VERSION=... figé au moment de sa
+        # sauvegarde (exécution précédente, potentiellement une version plus
+        # ancienne du script). Le sourcer écraserait la version RÉELLEMENT en
+        # cours d'exécution maintenant : on la sauvegarde avant, on la
+        # restaure après, pour que vps-helper/print_summary/step_save_state
+        # rapportent toujours la version du script qui tourne réellement.
+        local running_script_version="$SCRIPT_VERSION"
+        # shellcheck disable=SC1090
+        source "$STATE_FILE"
+        SCRIPT_VERSION="$running_script_version"
+        [[ -z "$SERVER_ROLE" ]] && SERVER_ROLE="1"
+        SSH_PUBLIC_KEYS=()
+        log_info "Configuration chargée : hostname=${SERVER_HOSTNAME}, admin=${ADMIN_USER}, rôle=$([[ "$SERVER_ROLE" == "1" ]] && echo manager || echo remote)."
+        log_info "Gestion des clés SSH : utiliser « vps-helper ssh-keys » après cette exécution si besoin."
+    else
+        collect_hostname
+        collect_admin_user
+        collect_ssh_keys
+        collect_timezone
+        collect_swap
+        collect_server_role
+        if [[ "$SERVER_ROLE" == "1" ]]; then
+            collect_dokploy_restrict_ip
+            collect_advertise_addr
+        fi
+        show_recap
+
+        confirm "Lancer l'initialisation avec ces paramètres ?" "o" \
+            || { log_warn "Annulé par l'utilisateur."; exit 0; }
+    fi
+
+    detect_server_ip
+
+    # En mode mise à jour, on ne relance pas un apt dist-upgrade complet à
+    # chaque fois (déjà couvert par unattended-upgrades / vps-helper update) —
+    # le mode mise à jour est documenté comme une réapplication légère de la
+    # config (MOTD, vps-helper, durcissement...), pas une maintenance système.
+    if [[ "$update_mode" -eq 0 ]]; then
+        step_update_system
+    else
+        log_info "Mode mise à jour : mise à jour système ignorée (voir unattended-upgrades / vps-helper update)."
+    fi
     step_hostname
     step_create_admin
     step_fail2ban
@@ -1584,8 +1936,14 @@ main() {
     step_motd
     step_vps_helper
     step_docker_log_limits
-    step_dokploy
-    step_traefik_tuning
+    if [[ "$SERVER_ROLE" == "1" ]]; then
+        step_dokploy
+        step_traefik_tuning
+    else
+        log_info "Rôle 'remote server' : Dokploy ne sera pas installé ici, il sera ajouté depuis le manager central."
+        ensure_docker
+    fi
+    step_save_state
 
     print_summary
     offer_password_cleanup

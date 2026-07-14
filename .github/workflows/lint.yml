@@ -24,10 +24,12 @@ jobs:
 
       - name: Extract and check embedded MOTD heredoc
         run: |
-          awk "/^cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" init-vps.sh > /tmp/motd_check.sh
+          awk "/cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" init-vps.sh > /tmp/motd_check.sh
+          [ -s /tmp/motd_check.sh ] || { echo "::error::Extraction du heredoc MOTD vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
           bash -n /tmp/motd_check.sh && echo "MOTD heredoc syntax OK"
 
       - name: Extract and check embedded vps-helper heredoc
         run: |
-          awk "/^cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" init-vps.sh > /tmp/helper_check.sh
+          awk "/cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" init-vps.sh > /tmp/helper_check.sh
+          [ -s /tmp/helper_check.sh ] || { echo "::error::Extraction du heredoc vps-helper vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
           bash -n /tmp/helper_check.sh && echo "vps-helper heredoc syntax OK"
