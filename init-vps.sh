@@ -455,7 +455,15 @@ detect_server_ip() {
     if [[ -z "$SERVER_IP" ]]; then
         SERVER_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | head -n1 || true)
     fi
-    [[ -z "$SERVER_IP" ]] && SERVER_IP="${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}"
+    # IMPORTANT : if/fi, jamais un `[[ cond ]] && affectation` en dernière
+    # instruction de la fonction. Quand SERVER_IP est déjà non vide (le cas
+    # normal), `[[ -z "$SERVER_IP" ]]` est faux → si c'est la DERNIÈRE
+    # commande de la fonction, son statut de sortie (1) devient celui de la
+    # fonction entière. Appelée en instruction nue dans main(), ça déclenche
+    # `set -e` et tue tout le script sans rien afficher (bug vécu en prod).
+    if [[ -z "$SERVER_IP" ]]; then
+        SERVER_IP="${ADVERTISE_ADDR:-<IP_DU_SERVEUR>}"
+    fi
 }
 
 ###############################################################################
@@ -1836,7 +1844,12 @@ print_summary() {
 }
 
 offer_password_cleanup() {
-    [[ -f "$PASSWORD_FILE" ]] || return
+    # `return` SANS code explicite reprend le statut de la dernière commande
+    # exécutée — ici le `[[ -f ]]` qui vient d'échouer (1). Appelée en
+    # instruction nue dans main(), une fonction qui "réussit en renvoyant 1"
+    # déclenche `set -e` et tue tout le script silencieusement juste après
+    # l'affichage du résumé final (bug historique, présent avant ce commit).
+    [[ -f "$PASSWORD_FILE" ]] || return 0
     if confirm "Mot de passe sudo noté ? Suppression du fichier maintenant ?" "n"; then
         shred -u "$PASSWORD_FILE"
         log_ok "Fichier mot de passe supprimé."
