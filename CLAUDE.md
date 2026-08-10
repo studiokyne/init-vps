@@ -182,7 +182,7 @@ awk "/cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/
 
 ### lint.yml
 
-Déclenché sur `push`, `pull_request`, et `workflow_call` (pour être appelé depuis release.yml).
+Déclenché sur `push` (hors `main`), `pull_request`, et `workflow_call` (appelé par `auto-release.yml`).
 
 - `bash -n init-vps.sh` — syntaxe du script principal
 - ShellCheck en mode strict (`severity: warning`) via `ludeeus/action-shellcheck@2.0.0`
@@ -215,15 +215,15 @@ L'algorithme de calcul : liste les tags `v{DATE}.*` existants via `git tag -l`, 
 
 Aucune convention de message de commit requise — chaque push vers `main` produit une release.
 
-### release.yml
+### Pas de second chemin de publication
 
-Déclenché sur push de tag `v*.*.*` (créé par release-please ou manuellement).
+`release.yml`, déclenché sur push de tag, a été **supprimé**. Il faisait le même travail
+qu'`auto-release.yml` par une autre voie, et ne se déclenchait de toute façon jamais seul :
+un tag créé par `GITHUB_TOKEN` ne relance pas de workflow.
 
-1. Appelle `lint.yml` via `workflow_call` — la release échoue si le lint échoue
-2. Extrait la version (`v1.2.0` → `1.2.0`) depuis le nom du tag
-3. Injecte la version dans une **copie** du script (`sed` sur `SCRIPT_VERSION`) — la branche principale conserve `0.0.0-dev`
-4. Publie une GitHub Release avec le script versionné comme asset `init-vps.sh`
-5. Notes de version générées automatiquement
+C'est cette duplication qui avait laissé vivre un contrôle de heredocs cassé sur le chemin
+de publication (voir plus haut). **Ne pas réintroduire un second workflow de release** :
+toute publication passe par `auto-release.yml`, tout contrôle vit dans `lint.yml`.
 
 ---
 
