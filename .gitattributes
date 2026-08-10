@@ -1,0 +1,7 @@
+# init-vps.sh est exécuté par bash sur un serveur Linux. Un CRLF dans le
+# shebang le rend inexécutable, et shellcheck noie la sortie sous des SC1017.
+# Le dépôt est déjà en LF ; ceci force aussi la copie de travail sous Windows,
+# où core.autocrlf convertirait sinon en CRLF au checkout.
+*.sh text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
