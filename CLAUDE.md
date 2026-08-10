@@ -41,6 +41,35 @@ Au lancement suivant, `main()` détecte ce fichier et propose (ou force via `sud
 
 **Piège corrigé à ce sujet** : `step_fail2ban` écrasait entièrement `jail.local` à chaque exécution, ce qui aurait effacé la liste blanche (`ignoreip`) ajoutée via `vps-helper whitelist` lors d'une relance. La ligne `ignoreip` existante est maintenant capturée avant réécriture et réinjectée. **Si une nouvelle étape régénère un fichier par `cat > ... <<EOF`, vérifier qu'elle ne détruit pas un état modifié depuis par un utilisateur ou par vps-helper.**
 
+### `print_summary()` — les « prochaines étapes » sont conditionnelles
+
+Chaque étape n'est affichée que si elle est **encore à faire**, sondée sur l'état réel :
+
+| Étape | Condition |
+|---|---|
+| Vérifier la connexion SSH | `UPDATE_MODE = 0` (une relance passe déjà par SSH) |
+| Pointer un domaine / configurer le TLS | `dokploy_has_tls_domain` faux |
+| Fermer le port 3000 | `dokploy_port_is_open` vrai |
+| Ajouter au manager | rôle remote |
+
+Si rien ne reste, le résumé affiche « Aucune action requise ». Réafficher la checklist
+d'une première installation à chaque relance est du bruit — et le bruit finit par faire
+ignorer les vraies alertes, comme le redémarrage requis après un nouveau kernel.
+
+- `dokploy_has_tls_domain()` lit `acme.json` (magasin de certificats Traefik, root-only)
+  et cherche une clé `"main"` : chaque certificat émis y porte son domaine.
+- `dokploy_port_is_open()` interroge **UFW**, pas `$DOKPLOY_PORT_CLOSED` : cette variable
+  ne connaît que les fermetures faites via `vps-helper close-dokploy`, pas un `ufw delete`
+  lancé à la main.
+- `step_sep()` insère la ligne vide entre deux étapes, jamais avant la première — sinon la
+  liste commence par un blanc dès qu'une étape amont est sautée. Elle lit `$step_n` par
+  portée dynamique.
+
+⚠️ **Le résumé recommande `vps-helper close-dokploy`, jamais `ufw delete allow 3000/tcp`.**
+Les deux ferment le port, mais seul le premier persiste le choix dans `config.env` ; un
+`ufw delete` brut serait **rouvert par `step_ufw_base`** à la prochaine relance. Le résumé
+conseillait la commande brute — il conseillait donc une action que le script défaisait.
+
 ---
 
 ## Conventions de code

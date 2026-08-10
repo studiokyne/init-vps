@@ -54,6 +54,29 @@ sudo ./init-vps.sh
 > [!IMPORTANT]
 > Le verrouillage SSH (phase 2) attend une **confirmation manuelle**. Garde ta session ouverte et teste la connexion avec le compte admin dans un **autre terminal** avant de valider — c'est le filet de sécurité qui évite de te verrouiller dehors.
 
+### Mettre à jour un serveur déjà initialisé
+
+Pour propager une nouvelle version du script (nouveau MOTD, nouvelle commande
+`vps-helper`, nouvelle règle sysctl…) sur un serveur déjà configuré :
+
+```bash
+curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
+  -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh --update
+```
+
+La configuration est relue depuis `/etc/init-vps/config.env` : **aucune question
+n'est reposée**, et toutes les étapes sont rejouées. Elles sont idempotentes, donc
+celles déjà en place sont simplement ignorées — y compris le verrouillage SSH, qui
+ne redemande aucune confirmation. La mise à jour des paquets système est volontairement
+sautée dans ce mode.
+
+Sans `--update`, le script détecte quand même la configuration existante et propose
+le mode mise à jour ; le drapeau ne fait que répondre « oui » d'avance.
+
+> [!NOTE]
+> À ne pas confondre avec `vps-helper update`, qui met à jour les **paquets du système**
+> (`apt`) et ne touche pas à la configuration posée par ce script.
+
 ---
 
 ## 🧭 Étapes exécutées

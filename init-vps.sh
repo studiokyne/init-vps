@@ -80,6 +80,10 @@ DOKPLOY_PORT_CLOSED=""
 PASSWORD_FILE=""
 SERVER_IP=""
 SUMMARY_FILE=""
+# Renseigné par main() une fois le mode résolu. print_summary() s'en sert pour
+# n'afficher que les actions encore pertinentes : sur une relance, les
+# « prochaines étapes » d'une première installation sont du bruit.
+UPDATE_MODE=0
 
 ###############################################################################
 # STYLE — couleurs sobres, désactivées si la sortie n'est pas un terminal
@@ -1778,6 +1782,31 @@ reboot_is_pending() {
     [[ -n "$newest" && "$newest" != "$running" ]]
 }
 
+# Un domaine est-il déjà configuré avec TLS dans Dokploy ?
+# On lit acme.json (le magasin de certificats de Traefik) : chaque certificat
+# émis y porte une clé "main" avec son domaine. Fichier root-only — le script
+# tourne en root, mais on reste tolérant en cas d'absence ou de rôle remote.
+dokploy_has_tls_domain() {
+    local acme=/etc/dokploy/traefik/dynamic/acme.json
+    [[ -s "$acme" ]] || return 1
+    grep -q '"main"[[:space:]]*:' "$acme" 2>/dev/null
+}
+
+# Le port 3000 est-il encore ouvert dans UFW ? On interroge l'état réel plutôt
+# que $DOKPLOY_PORT_CLOSED : ce dernier ne connaît que les fermetures faites
+# via `vps-helper close-dokploy`, pas un `ufw delete` lancé à la main.
+dokploy_port_is_open() {
+    ufw status 2>/dev/null | grep -q '3000/tcp'
+}
+
+# Sépare deux étapes par une ligne vide, sauf avant la première : sinon la
+# liste commence par un blanc dès qu'une étape amont est sautée.
+# Lit $step_n de print_summary via la portée dynamique de bash.
+step_sep() {
+    [[ "${step_n:-1}" -gt 1 ]] && echo ""
+    return 0
+}
+
 print_summary() {
     # Calculé ici (et non en début de script) pour éviter tout décalage avec
     # le fuseau horaire défini en cours de route (step_system_misc).
@@ -1823,40 +1852,68 @@ print_summary() {
         echo ""
         echo "PROCHAINES ÉTAPES"
         echo "──────────────────────────────────────────────────"
-        local step_n=1
-        echo "${step_n}. Vérifier la connexion SSH depuis un nouveau terminal :"
-        echo "     ssh ${ADMIN_USER}@${SERVER_IP}"
-        step_n=$((step_n+1))
+
+        # Chaque étape est conditionnée à son état réel : sur une relance en
+        # mode mise à jour, réafficher la checklist d'une première installation
+        # est du bruit, et le bruit finit par faire ignorer les vraies alertes
+        # (le redémarrage requis, par exemple).
+        local step_n=1 has_domain=0 port_open=0
+        dokploy_has_tls_domain && has_domain=1
+        dokploy_port_is_open && port_open=1
+
+        # La connexion SSH n'a besoin d'être validée qu'après le verrouillage
+        # initial. En mode mise à jour, elle l'est déjà — le script tourne
+        # justement à travers elle.
+        if [[ "$UPDATE_MODE" -eq 0 ]]; then
+            echo "${step_n}. Vérifier la connexion SSH depuis un nouveau terminal :"
+            echo "     ssh ${ADMIN_USER}@${SERVER_IP}"
+            step_n=$((step_n+1))
+        fi
+
         if [[ "$SERVER_ROLE" == "1" ]]; then
-            echo ""
-            echo "${step_n}. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
-            step_n=$((step_n+1))
-            echo ""
-            echo "${step_n}. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
-            step_n=$((step_n+1))
-            echo ""
-            echo "${step_n}. Une fois le domaine actif, fermer manuellement l'accès direct au port 3000 :"
-            if [[ -n "$DOKPLOY_RESTRICT_IP" ]]; then
-                echo "     ufw delete allow from ${DOKPLOY_RESTRICT_IP} to any port 3000 proto tcp"
-            else
-                echo "     ufw delete allow 3000/tcp"
+            if [[ "$has_domain" -eq 0 ]]; then
+                step_sep
+                echo "${step_n}. Pointer un nom de domaine vers ${SERVER_IP} (enregistrement DNS de type A)."
+                step_n=$((step_n+1))
+                step_sep
+                echo "${step_n}. Dans Dokploy (http://${SERVER_IP}:3000), configurer le domaine et activer le TLS automatique."
+                step_n=$((step_n+1))
             fi
-            step_n=$((step_n+1))
-            echo ""
-            echo "${step_n}. Désactiver l'accès direct via ip:port dans les réglages Dokploy."
-            step_n=$((step_n+1))
+
+            if [[ "$port_open" -eq 1 ]]; then
+                step_sep
+                if [[ "$has_domain" -eq 1 ]]; then
+                    echo "${step_n}. Un domaine TLS est actif : fermer l'accès direct au port 3000."
+                else
+                    echo "${step_n}. Une fois le domaine actif, fermer l'accès direct au port 3000."
+                fi
+                # `vps-helper close-dokploy` et NON un `ufw delete` brut : lui
+                # seul persiste le choix dans config.env. Un ufw delete manuel
+                # serait rouvert par step_ufw_base à la prochaine relance.
+                echo "     sudo vps-helper close-dokploy"
+                step_n=$((step_n+1))
+                step_sep
+                echo "${step_n}. Désactiver l'accès direct via ip:port dans les réglages Dokploy."
+                step_n=$((step_n+1))
+            fi
         else
-            echo ""
+            step_sep
             echo "${step_n}. Ajouter ce serveur depuis le manager Dokploy : Settings → Servers → Add Server"
             echo "     IP : ${SERVER_IP} · Port SSH : ${SSH_PORT} · Utilisateur : ${ADMIN_USER}"
             step_n=$((step_n+1))
         fi
+
         if [[ -f "$PASSWORD_FILE" ]]; then
-            echo ""
+            step_sep
             echo "${step_n}. Supprimer le fichier mot de passe une fois noté :"
             echo "     shred -u ${PASSWORD_FILE}"
             step_n=$((step_n+1))
         fi
+
+        if [[ "$step_n" -eq 1 ]]; then
+            echo "Aucune action requise — le serveur est déjà entièrement configuré."
+        fi
+
         if reboot_is_pending; then
             echo ""
             echo "⚠ Un nouveau kernel a été installé : redémarrer le serveur pour le charger :"
@@ -1916,6 +1973,8 @@ main() {
     elif [[ "$update_mode" -eq 1 ]]; then
         error "Mode mise à jour demandé (--update) mais aucune configuration sauvegardée trouvée (${STATE_FILE}). Lancer d'abord une installation complète (sans --update)."
     fi
+
+    UPDATE_MODE="$update_mode"
 
     if [[ "$update_mode" -eq 1 ]]; then
         # $STATE_FILE contient un SCRIPT_VERSION=... figé au moment de sa
