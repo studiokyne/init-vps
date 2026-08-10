@@ -812,7 +812,24 @@ EOF
 # peut echouer sous pression memoire : la sauvegarde est perdue en silence.
 # Redis emet un WARNING a chaque demarrage tant que ce n'est pas pose.
 vm.overcommit_memory = 1
+
+# Hote Docker : on evite de sortir vers le swap des pages froides encore
+# utiles (a-coups de latence au reveil d'un conteneur inactif). Le noyau
+# recupere du cache plutot que de swapper ; vfs_cache_pressure tempere ca en
+# gardant plus longtemps les metadonnees de fichiers.
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
 EOF
+
+    # Migration : ces deux clés vivaient dans 99-swap.conf, écrit par step_swap.
+    # Sur un serveur déjà provisionné, le laisser donnerait deux sources de
+    # vérité pour les mêmes réglages. Valeurs identiques, donc suppression sans
+    # risque — sauvegardée comme le reste.
+    if [[ -f /etc/sysctl.d/99-swap.conf ]]; then
+        backup_file /etc/sysctl.d/99-swap.conf
+        rm -f /etc/sysctl.d/99-swap.conf
+        log_info "Ancien /etc/sysctl.d/99-swap.conf retiré (réglages repris dans 99-memory.conf)."
+    fi
 
     # --system charge tous les fichiers ; on ignore les clés IPv6 absentes si
     # l'IPv6 est désactivé au boot (sysctl --system n'échoue pas là-dessus).
@@ -855,12 +872,6 @@ step_swap() {
     fi
     grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
-    backup_file /etc/sysctl.d/99-swap.conf
-    cat > /etc/sysctl.d/99-swap.conf <<'EOF'
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-EOF
-    sysctl --system >/dev/null
     log_ok "Swap de ${SWAP_SIZE_GB} Go créé."
 }
 
