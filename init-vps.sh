@@ -369,8 +369,11 @@ recommend_swap_gb() {
 
 collect_swap() {
     log_step "Swap"
-    if swapon --show | grep -q '/swapfile'; then
-        log_info "Un swapfile existe déjà sur ce serveur, cette étape sera ignorée."
+    # Même test que step_swap : tout swap actif, pas seulement /swapfile. Un
+    # provider qui fournit une PARTITION de swap ne matchait pas ce motif, et
+    # le script demandait une taille... que step_swap ignorait ensuite.
+    if swapon --show --noheadings 2>/dev/null | grep -q .; then
+        log_info "Un swap est déjà actif sur ce serveur ($(free -h | awk '/^Swap:/ {print $2}')), cette étape sera ignorée."
         SWAP_SIZE_GB=0
         return
     fi
@@ -847,7 +850,11 @@ EOF
 step_swap() {
     log_step "Création du swap"
     if [[ "$SWAP_SIZE_GB" -eq 0 ]]; then
-        log_info "Swap ignoré (0 Go demandé, ou swap déjà présent)."
+        if swapon --show --noheadings 2>/dev/null | grep -q .; then
+            log_info "Swap déjà actif ($(free -h | awk '/^Swap:/ {print $2}')), création ignorée."
+        else
+            log_info "Aucun swap demandé (0 Go), création ignorée."
+        fi
         return
     fi
     # Détecte tout swap déjà actif (swapfile OU partition fournie par le provider)
@@ -1834,13 +1841,25 @@ print_summary() {
         echo "Compte admin      : ${ADMIN_USER}"
         echo "Port SSH          : ${SSH_PORT}"
         echo "Clé(s) SSH        : ${key_count} installée(s) (gestion : vps-helper ssh-keys)"
-        if [[ "$SWAP_SIZE_GB" -eq 0 ]]; then
-            echo "Swap              : aucun (ou déjà présent)"
+        # État réel du swap, pas la valeur demandée : $SWAP_SIZE_GB vaut 0 aussi
+        # bien quand aucun swap n'a été voulu que lorsqu'un swap préexistant a
+        # fait sauter l'étape. Afficher « aucun (ou déjà présent) » revenait à
+        # dire qu'on ne sait pas — alors que `swapon` le sait.
+        local swap_total
+        swap_total=$(free -h 2>/dev/null | awk '/^Swap:/ {print $2}')
+        if [[ -n "$swap_total" && "$swap_total" != "0B" && "$swap_total" != "0" ]]; then
+            echo "Swap              : ${swap_total} actif"
         else
-            echo "Swap              : ${SWAP_SIZE_GB} Go"
+            echo "Swap              : aucun"
         fi
         if [[ "$SERVER_ROLE" == "1" ]]; then
-            echo "Dokploy           : http://${SERVER_IP}:3000"
+            # Ne pas annoncer une URL qui ne répond plus : une fois le port
+            # fermé, l'interface passe par le domaine configuré dans Dokploy.
+            if dokploy_port_is_open; then
+                echo "Dokploy           : http://${SERVER_IP}:3000"
+            else
+                echo "Dokploy           : installé — port 3000 fermé, accès par le domaine configuré"
+            fi
         else
             echo "Rôle              : Remote server — prêt à être ajouté depuis Dokploy (Settings → Servers → Add Server)"
         fi

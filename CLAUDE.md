@@ -52,6 +52,21 @@ Chaque étape n'est affichée que si elle est **encore à faire**, sondée sur l
 | Fermer le port 3000 | `dokploy_port_is_open` vrai |
 | Ajouter au manager | rôle remote |
 
+Les lignes d'en-tête suivent la même règle — **elles rapportent l'état réel, pas la valeur
+demandée** :
+
+- **Swap** : lu via `free`, jamais via `$SWAP_SIZE_GB`. Cette variable vaut `0` aussi bien
+  quand aucun swap n'a été voulu que lorsqu'un swap préexistant a fait sauter l'étape ;
+  afficher « aucun (ou déjà présent) » revenait à avouer qu'on ne savait pas. Même raison
+  pour les logs de `collect_swap` et `step_swap`.
+- **Dokploy** : l'URL `http://IP:3000` n'est affichée que si le port est encore ouvert.
+  Une fois fermé, annoncer cette adresse serait un lien mort.
+
+⚠️ `collect_swap` teste **tout swap actif** (`swapon --show --noheadings`), pas seulement
+`/swapfile`. Le motif d'origine ne matchait pas une **partition** de swap fournie par le
+provider : le script demandait alors une taille que `step_swap`, lui correctement gardé,
+ignorait ensuite.
+
 Si rien ne reste, le résumé affiche « Aucune action requise ». Réafficher la checklist
 d'une première installation à chaque relance est du bruit — et le bruit finit par faire
 ignorer les vraies alertes, comme le redémarrage requis après un nouveau kernel.
