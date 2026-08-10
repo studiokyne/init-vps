@@ -2,6 +2,11 @@ name: Lint
 
 on:
   push:
+    # `main` est déjà couvert : auto-release.yml y appelle ce workflow via
+    # workflow_call avant de publier. Sans cette exclusion, chaque push sur
+    # main lançait deux fois les mêmes contrôles.
+    branches-ignore:
+      - main
   pull_request:
   workflow_call:
 

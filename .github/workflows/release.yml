@@ -25,10 +25,17 @@ jobs:
 
       - name: Inject version into script
         run: |
-          sed "s/^SCRIPT_VERSION=.*/SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
+          # `0,/re/s//…/` = première occurrence SEULEMENT. `^SCRIPT_VERSION=`
+          # matche aussi la ligne du heredoc de step_save_state (config.env),
+          # qu'on ne veut pas figer : elle doit rester ${SCRIPT_VERSION}.
+          sed "0,/^SCRIPT_VERSION=.*/s//SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
             init-vps.sh > /tmp/init-vps.sh
           chmod +x /tmp/init-vps.sh
           bash -n /tmp/init-vps.sh
+          # Garde-fou : sans lui, un motif sed devenu obsolète publierait un
+          # script marqué 0.0.0-dev sans que rien ne le signale.
+          grep -q "^SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"$" /tmp/init-vps.sh \
+            || { echo "::error::SCRIPT_VERSION non substituée — le motif sed ne matche plus init-vps.sh"; exit 1; }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

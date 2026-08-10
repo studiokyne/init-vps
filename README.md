@@ -61,7 +61,7 @@ sudo ./init-vps.sh
 | #   | Étape                                               | #   | Étape                                       |
 | --- | --------------------------------------------------- | --- | ------------------------------------------- |
 | 0   | Collecte interactive + récapitulatif + confirmation | 9   | unattended-upgrades (MAJ sécurité auto)     |
-| 1   | Mise à jour du système                              | 10  | Durcissement sysctl réseau                  |
+| 1   | Mise à jour du système                              | 10  | Durcissement sysctl (réseau + mémoire)      |
 | 2   | Définition du hostname                              | 11  | Swap (taille selon la RAM détectée)         |
 | 3   | Compte admin (sudo) + clé(s) SSH                    | 12  | Fuseau horaire / NTP / logs journald        |
 | 4   | fail2ban (activé **avant** l'ouverture SSH)         | 13  | MOTD personnalisé                           |

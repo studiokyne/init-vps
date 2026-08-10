@@ -146,7 +146,23 @@ Déclenché sur `push`, `pull_request`, et `workflow_call` (pour être appelé d
 
 ### auto-release.yml
 
-Déclenché sur push vers `main`. Enchaîne en un seul job : lint → calcul de version → build → publication.
+Déclenché sur push vers `main`. Deux jobs : `lint` (via `workflow_call` vers `lint.yml`) puis
+`auto-release` (calcul de version → build → publication).
+
+⚠️ **Les contrôles ne sont jamais recopiés ici — ils sont réutilisés.** La version précédente
+dupliquait les étapes de `lint.yml`, et la copie avait dérivé : son motif `awk` était ancré sur
+`^cat` alors que les deux heredocs sont indentés dans des fonctions. L'extraction renvoyait
+0 ligne et `bash -n` sur un fichier vide réussit — le contrôle des heredocs ne testait donc
+**rien**, précisément sur le chemin qui publie les releases. C'est le même piège que celui
+documenté plus haut pour `lint.yml`, corrigé là-bas seulement. Toute nouvelle porte de
+validation va dans `lint.yml`.
+
+⚠️ **La substitution de version utilise `sed "0,/^SCRIPT_VERSION=.*/s//…/"`, pas un `s///`
+global.** `^SCRIPT_VERSION=` matche **deux** lignes : la constante en tête de fichier, et la
+ligne du heredoc de `step_save_state` qui écrit `config.env`, laquelle doit rester
+`${SCRIPT_VERSION}`. Un `sed` non borné fige les deux. Un `grep -q` vérifie ensuite que la
+substitution a bien eu lieu : sans lui, un motif devenu obsolète publierait un script marqué
+`0.0.0-dev` en silence.
 
 Format de version : `YYYY.MM.DD.N` (N incrémental sur la journée, repart à 1 chaque jour).
 Exemple : `v2026.06.21.1`, puis `v2026.06.21.2` si un second push a lieu le même jour.

@@ -6,8 +6,18 @@ on:
       - main
 
 jobs:
+  # Les contrôles vivent dans lint.yml et sont RÉUTILISÉS ici, jamais recopiés.
+  # La version dupliquée qui existait avant ancrait son motif awk sur `^cat`
+  # alors que les deux heredocs sont indentés dans des fonctions : l'extraction
+  # renvoyait 0 ligne et `bash -n` sur un fichier vide réussit. Le contrôle des
+  # heredocs ne testait donc rien sur le chemin qui publie les releases.
+  lint:
+    name: ShellCheck + syntax
+    uses: ./.github/workflows/lint.yml
+
   auto-release:
-    name: Lint + version + release
+    name: Version + release
+    needs: lint
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,23 +25,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Syntax check — init-vps.sh
-        run: bash -n init-vps.sh
-
-      - name: ShellCheck — init-vps.sh
-        uses: ludeeus/action-shellcheck@2.0.0
-        with:
-          severity: warning
-
-      - name: Syntax check — heredocs embarqués
-        run: |
-          awk "/^cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" \
-            init-vps.sh > /tmp/motd_check.sh
-          bash -n /tmp/motd_check.sh
-          awk "/^cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" \
-            init-vps.sh > /tmp/helper_check.sh
-          bash -n /tmp/helper_check.sh
 
       - name: Compute version
         id: version
@@ -44,10 +37,17 @@ jobs:
 
       - name: Build versioned script
         run: |
-          sed "s/^SCRIPT_VERSION=.*/SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
+          # `0,/re/s//…/` = première occurrence SEULEMENT. `^SCRIPT_VERSION=`
+          # matche aussi la ligne du heredoc de step_save_state (config.env),
+          # qu'on ne veut pas figer : elle doit rester ${SCRIPT_VERSION}.
+          sed "0,/^SCRIPT_VERSION=.*/s//SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
             init-vps.sh > /tmp/init-vps.sh
           chmod +x /tmp/init-vps.sh
           bash -n /tmp/init-vps.sh
+          # Garde-fou : le sed doit avoir réellement substitué la version, sinon
+          # on publierait un script marqué 0.0.0-dev sans que rien ne le signale.
+          grep -q "^SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"$" /tmp/init-vps.sh \
+            || { echo "::error::SCRIPT_VERSION non substituée — le motif sed ne matche plus init-vps.sh"; exit 1; }
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
