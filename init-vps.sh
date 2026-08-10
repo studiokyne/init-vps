@@ -36,7 +36,7 @@
 #      manuelle que la connexion admin/sudo fonctionne)
 #   8. Verrouillage du compte root (défense en profondeur, en plus du SSH)
 #   9. unattended-upgrades (MAJ sécurité auto, sans reboot)
-#  10. Durcissement sysctl réseau
+#  10. Durcissement sysctl (réseau + mémoire pour Redis/Dokploy)
 #  11. Swap (taille recommandée selon la RAM détectée, ajustable)
 #  12. Fuseau horaire / NTP / limites des logs journald
 #  13. MOTD personnalisé (design uniforme à la connexion SSH)
@@ -761,11 +761,12 @@ EOF
 }
 
 ###############################################################################
-# 10. DURCISSEMENT SYSCTL RÉSEAU
+# 10. DURCISSEMENT SYSCTL (RÉSEAU + MÉMOIRE)
 ###############################################################################
 step_sysctl_hardening() {
-    log_step "Durcissement réseau (sysctl)"
+    log_step "Durcissement sysctl (réseau + mémoire)"
     backup_file /etc/sysctl.d/99-hardening.conf
+    backup_file /etc/sysctl.d/99-memory.conf
     cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
 # Anti spoofing
 net.ipv4.conf.all.rp_filter = 1
@@ -800,10 +801,23 @@ net.ipv6.conf.default.accept_redirects = 0
 # IMPORTANT : requis par le réseau Docker, ne pas désactiver
 net.ipv4.ip_forward = 1
 EOF
+
+    # Mémoire — volontairement PAS dans 99-swap.conf : cette étape-là retourne
+    # tôt quand un swap est déjà actif (partition fournie par le provider), et
+    # le réglage serait alors silencieusement absent. Ici il s'applique toujours,
+    # et pour les deux rôles : un remote server héberge aussi des conteneurs.
+    cat > /etc/sysctl.d/99-memory.conf <<'EOF'
+# Redis (celui de Dokploy, et tout conteneur Redis avec persistance) fait un
+# fork() pour ecrire ses sauvegardes en arriere-plan. Sans overcommit, ce fork
+# peut echouer sous pression memoire : la sauvegarde est perdue en silence.
+# Redis emet un WARNING a chaque demarrage tant que ce n'est pas pose.
+vm.overcommit_memory = 1
+EOF
+
     # --system charge tous les fichiers ; on ignore les clés IPv6 absentes si
     # l'IPv6 est désactivé au boot (sysctl --system n'échoue pas là-dessus).
     sysctl --system >/dev/null 2>&1 || sysctl --system >/dev/null
-    log_ok "Durcissement réseau appliqué (IPv4 + IPv6)."
+    log_ok "Durcissement sysctl appliqué (réseau IPv4/IPv6 + mémoire)."
 }
 
 ###############################################################################
