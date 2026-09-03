@@ -129,6 +129,7 @@ Commande d'administration installée sur le serveur lors de l'initialisation.
 | `vps-helper whitelist <IP>`    | Ajouter une IP de confiance (jamais bannie par fail2ban)      |
 | `vps-helper unban <IP>`        | Débannir une IP bannie par fail2ban                           |
 | `vps-helper close-dokploy`     | Fermer l'accès direct au port 3000 (Dokploy)                  |
+| `vps-helper ssh-keys <list\|add\|remove> [user]` | Gérer les clés SSH d'un utilisateur (défaut : compte admin) |
 | `vps-helper restart <service>` | Redémarrer un service : `ssh`, `fail2ban`, `docker`           |
 | `vps-helper logs <conteneur>`  | Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter) |
 | `vps-helper update`            | Mettre à jour le système (sécurité incluse)                   |
@@ -147,7 +148,7 @@ Audit de lecture seule. Vérifie :
 - **fail2ban** — service actif, jails `sshd` et `recidive`
 - **Compte root** — verrouillé
 - **Docker** — rotation des logs (`max-size` dans `daemon.json`)
-- **Ports publiés par Docker** — tout port exposé sur `0.0.0.0` hors 80/443, et état de la chaîne `DOCKER-USER`
+- **Ports publiés par Docker** — tout port exposé sur toutes les interfaces hors 80/443 (conteneurs **et** services Swarm), et état de la chaîne `DOCKER-USER`
 - **Traefik** — HTTP/3 activé, middleware `compression` attaché à `websecure`
 - **unattended-upgrades** — service actif
 - **Informationnel** — swap, port 3000, redémarrage requis, état Docker Swarm
@@ -175,6 +176,8 @@ Contrairement à `ufw-docker`, cette approche survit aux redémarrages et ne cas
 | Première installation                      | Règles appliquées directement — aucun conteneur n'existe encore, rien à casser    |
 | Mode `--update` avec des conteneurs actifs | Les ports qui seraient coupés sont listés, puis confirmation demandée (défaut : non) |
 | Règles `DOCKER-USER` déjà posées par un tiers | Rien n'est modifié, un avertissement est affiché                                |
+
+L'inventaire des ports croise **deux** sources : `docker ps` et `docker service ls`. Aucune n'est complète — un service Swarm publié en mode ingress n'apparaît pas dans `docker ps` (son conteneur de tâche ne montre que ses ports internes), et un conteneur hors Swarm n'apparaît que là.
 
 Pilotage après coup : `vps-helper docker-firewall status|apply|clear`. `clear` est le filet de sécurité si les règles cassent un service.
 

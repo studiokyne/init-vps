@@ -1527,6 +1527,16 @@ DOCKER_USER_APPLY=/usr/local/lib/docker-user/apply.sh
 
 # Un « port/proto » par ligne, dédoublonné. `done < <(...)` et non un pipe :
 # la boucle doit tourner dans le shell courant.
+# Deux sources, car aucune n'est complète : un service Swarm publié en mode
+# ingress n'apparaît PAS dans `docker ps` (son conteneur de tâche ne montre
+# que ses ports internes) — seul `docker service ls` le liste, sous la forme
+# « *:3000->3000/tcp ». À l'inverse, un conteneur hors Swarm n'existe que
+# dans `docker ps`.
+docker_port_sources() {
+    docker ps --format '{{.Ports}}' 2>/dev/null || true
+    docker service ls --format '{{.Ports}}' 2>/dev/null || true
+}
+
 docker_published_public_ports() {
     command -v docker >/dev/null 2>&1 || return 0
     local line chunk hostport proto
@@ -1537,13 +1547,14 @@ docker_published_public_ports() {
         for chunk in "${chunks[@]}"; do
             chunk="${chunk// /}"
             [[ "$chunk" == *'->'* ]] || continue
-            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* ]] || continue
+            # 0.0.0.0:/[::]: pour un conteneur, *: pour un service Swarm.
+            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* || "$chunk" == '*:'* ]] || continue
             hostport="${chunk%%->*}"
             hostport="${hostport##*:}"
             proto="${chunk##*/}"
             echo "${hostport}/${proto}"
         done
-    done < <(docker ps --format '{{.Ports}}' 2>/dev/null) | sort -u
+    done < <(docker_port_sources) | sort -u
 }
 
 docker_user_rules() {
@@ -1582,7 +1593,7 @@ cmd_docker_firewall() {
             else
                 warn "Unit docker-user-rules.service non activée : les règles ne survivront pas à un redémarrage."
             fi
-            printf '\n%b\n' "${C_BOLD}Ports publiés sur 0.0.0.0${C_RESET}"
+            printf '\n%b\n' "${C_BOLD}Ports publiés (conteneurs et services Swarm)${C_RESET}"
             # L'état de la chaîne est connu ici : annoncer « bloqué SI les
             # règles sont posées » alors qu'on vient de les lister serait une
             # hypothèse là où on a la réponse.
@@ -1699,11 +1710,11 @@ cmd_check() {
     while IFS= read -r published; do
         [ -z "$published" ] && continue
         case "$published" in 80/tcp|443/tcp|443/udp) continue ;; esac
-        chk_fail "Port ${published} publié sur 0.0.0.0 (exposé si DOCKER-USER ne le filtre pas)"; fail=$((fail+1))
+        chk_fail "Port ${published} publié sur toutes les interfaces (exposé si DOCKER-USER ne le filtre pas)"; fail=$((fail+1))
         port_found=1
     done < <(docker_published_public_ports)
     if [ "$port_found" -eq 0 ]; then
-        chk_pass "Aucun port publié sur 0.0.0.0 en dehors de 80/443"; pass=$((pass+1))
+        chk_pass "Aucun port publié sur toutes les interfaces en dehors de 80/443"; pass=$((pass+1))
     fi
     if ! command -v iptables >/dev/null 2>&1; then
         chk_info "DOCKER-USER : iptables absent, état non vérifiable"
@@ -1866,13 +1877,24 @@ docker_published_public_ports() {
         for chunk in "${chunks[@]}"; do
             chunk="${chunk// /}"
             [[ "$chunk" == *'->'* ]] || continue
-            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* ]] || continue
+            # 0.0.0.0:/[::]: pour un conteneur, *: pour un service Swarm.
+            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* || "$chunk" == '*:'* ]] || continue
             hostport="${chunk%%->*}"
             hostport="${hostport##*:}"
             proto="${chunk##*/}"
             echo "${hostport}/${proto}"
         done
-    done < <(docker ps --format '{{.Ports}}' 2>/dev/null) | sort -u
+    done < <(docker_port_sources) | sort -u
+}
+
+# Deux sources, car aucune n'est complète : un service Swarm publié en mode
+# ingress n'apparaît PAS dans `docker ps` (son conteneur de tâche ne montre
+# que ses ports internes, ex. « 3000/tcp » pour Dokploy) — seul
+# `docker service ls` le liste, sous la forme « *:3000->3000/tcp ». À
+# l'inverse, un conteneur hors Swarm n'existe que dans `docker ps`.
+docker_port_sources() {
+    docker ps --format '{{.Ports}}' 2>/dev/null || true
+    docker service ls --format '{{.Ports}}' 2>/dev/null || true
 }
 
 # La chaîne DOCKER-USER existe toujours (Docker la crée), mais `-N` seul ne
@@ -2053,12 +2075,12 @@ step_docker_ports_audit() {
     while IFS= read -r p; do
         [[ -z "$p" ]] && continue
         case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
-        log_warn "Port ${p} publié sur 0.0.0.0 (toutes interfaces)."
+        log_warn "Port ${p} publié sur toutes les interfaces (conteneur ou service Swarm)."
         found=1
     done < <(docker_published_public_ports)
 
     if [[ "$found" -eq 0 ]]; then
-        log_ok "Aucun port publié sur 0.0.0.0 en dehors de 80/443."
+        log_ok "Aucun port publié sur toutes les interfaces en dehors de 80/443."
     else
         log_info "Aucune correction automatique : arbitrer port par port (publier sur 127.0.0.1 plutôt que 0.0.0.0, ou laisser DOCKER-USER filtrer)."
     fi

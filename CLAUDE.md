@@ -46,6 +46,15 @@ Deux étapes distinctes en découlent, avec des rôles opposés :
 - `step_docker_ports_audit` (17) — **lecture seule**, aucun correctif : couper
   un port publié en production serait plus dangereux que de le signaler.
 
+`docker_published_public_ports()` croise **deux** sources, dupliquée à
+l'identique dans le parent et dans `HELPEREOF` : `docker ps` (préfixes
+`0.0.0.0:` / `[::]:`) **et** `docker service ls` (préfixe `*:`). Aucune n'est
+complète — un service Swarm publié en mode ingress n'apparaît pas dans
+`docker ps` (son conteneur de tâche ne montre que ses ports internes, ex.
+`3000/tcp` pour Dokploy), un conteneur hors Swarm n'apparaît que là. **Ne pas
+retirer l'une des deux.** À noter : `ss -lntup | grep docker-proxy` ne remplace
+ni l'une ni l'autre — avec Docker 29 (nftables direct) il ne renvoie rien.
+
 Comportement différencié, c'est le cœur du dispositif :
 
 | Contexte | Comportement |
