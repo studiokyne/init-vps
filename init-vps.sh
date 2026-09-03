@@ -1583,13 +1583,24 @@ cmd_docker_firewall() {
                 warn "Unit docker-user-rules.service non activée : les règles ne survivront pas à un redémarrage."
             fi
             printf '\n%b\n' "${C_BOLD}Ports publiés sur 0.0.0.0${C_RESET}"
-            local published found=0
+            # L'état de la chaîne est connu ici : annoncer « bloqué SI les
+            # règles sont posées » alors qu'on vient de les lister serait une
+            # hypothèse là où on a la réponse.
+            local published found=0 filtered=1
+            docker_user_chain_is_empty && filtered=0
             while IFS= read -r published; do
                 [ -z "$published" ] && continue
                 found=1
                 case "$published" in
-                    80/tcp|443/tcp|443/udp) info "  ${published} (autorisé par les règles)" ;;
-                    *)                      warn "  ${published} (bloqué depuis Internet si les règles sont posées)" ;;
+                    80/tcp|443/tcp|443/udp)
+                        info "  ${published} (autorisé)" ;;
+                    *)
+                        if [ "$filtered" -eq 1 ]; then
+                            warn "  ${published} (bloqué depuis Internet par DOCKER-USER)"
+                        else
+                            warn "  ${published} (exposé à Internet : aucune règle DOCKER-USER)"
+                        fi
+                        ;;
                 esac
             done < <(docker_published_public_ports)
             [ "$found" -eq 0 ] && info "  aucun"
@@ -1864,18 +1875,22 @@ docker_published_public_ports() {
     done < <(docker ps --format '{{.Ports}}' 2>/dev/null) | sort -u
 }
 
+# La chaîne DOCKER-USER existe toujours (Docker la crée), mais `-N` seul ne
+# filtre rien : c'est la présence de règles qui compte.
+docker_user_rules() {
+    iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true
+}
+
+docker_user_chain_is_empty() {
+    [[ -z "$(docker_user_rules)" ]]
+}
+
 # Règles posées par init-vps ? Elles portent toutes le commentaire iptables
 # « init-vps », ce qui permet de les distinguer de règles tierces.
 docker_user_has_foreign_rules() {
     local rules
-    rules="$(iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true)"
+    rules="$(docker_user_rules)"
     [[ -n "$rules" ]] && ! grep -q -- '--comment init-vps' <<< "$rules"
-}
-
-docker_user_is_empty() {
-    local rules
-    rules="$(iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true)"
-    [[ -z "$rules" ]]
 }
 
 step_docker_user_firewall() {
@@ -1952,6 +1967,9 @@ WantedBy=multi-user.target
 UNITEOF
     systemctl daemon-reload
 
+    local rules_present=0
+    docker_user_chain_is_empty || rules_present=1
+
     if docker_user_has_foreign_rules; then
         log_warn "La chaîne DOCKER-USER contient déjà des règles qui ne viennent pas d'init-vps : rien n'est appliqué pour ne pas les écraser."
         log_warn "Les inspecter (« iptables -S DOCKER-USER »), puis, si elles sont remplaçables : systemctl enable --now docker-user-rules.service"
@@ -1970,14 +1988,27 @@ UNITEOF
         done < <(docker_published_public_ports)
 
         if [[ "${#cut_ports[@]}" -gt 0 ]]; then
-            log_warn "Des conteneurs publient des ports qui deviendraient inaccessibles depuis Internet :"
-            for p in "${cut_ports[@]}"; do
-                log_warn "    - ${p}"
-            done
-            log_info "Ces ports resteraient joignables depuis les réseaux privés (10/8, 172.16/12, 192.168/16)."
-            if ! confirm "Appliquer quand même les règles DOCKER-USER ?" "n"; then
-                log_warn "Règles non appliquées. Pour le faire plus tard : sudo systemctl enable --now docker-user-rules.service"
-                return
+            # Distinguer les deux situations : demander « appliquer quand même ? »
+            # alors que la chaîne est DÉJÀ remplie laisse croire qu'un refus
+            # rétablirait l'accès, alors qu'il ne fait que sauter une
+            # réapplication à l'identique — les ports sont bloqués dans les deux
+            # cas. La question n'est posée que si l'état change réellement.
+            if [[ "$rules_present" -eq 1 ]]; then
+                log_info "Ports publiés déjà bloqués depuis Internet par les règles en place (réapplication sans effet sur eux) :"
+                for p in "${cut_ports[@]}"; do
+                    log_info "    - ${p}"
+                done
+                log_info "Pour rétablir leur accès : sudo vps-helper docker-firewall clear (retire tout le filtrage)."
+            else
+                log_warn "Des conteneurs publient des ports qui deviendraient inaccessibles depuis Internet :"
+                for p in "${cut_ports[@]}"; do
+                    log_warn "    - ${p}"
+                done
+                log_info "Ces ports resteraient joignables depuis les réseaux privés (10/8, 172.16/12, 192.168/16)."
+                if ! confirm "Appliquer quand même les règles DOCKER-USER ?" "n"; then
+                    log_warn "Règles non appliquées. Pour le faire plus tard : sudo systemctl enable --now docker-user-rules.service"
+                    return
+                fi
             fi
         fi
     fi
@@ -2032,7 +2063,7 @@ step_docker_ports_audit() {
         log_info "Aucune correction automatique : arbitrer port par port (publier sur 127.0.0.1 plutôt que 0.0.0.0, ou laisser DOCKER-USER filtrer)."
     fi
 
-    if command -v iptables &>/dev/null && docker_user_is_empty; then
+    if command -v iptables &>/dev/null && docker_user_chain_is_empty; then
         log_warn "La chaîne DOCKER-USER est vide : UFW ne filtrant pas les ports publiés par Docker, la protection ne dépend plus que d'un éventuel pare-feu externe (Hetzner Cloud Firewall & assimilés), invisible depuis ce serveur."
     fi
 }

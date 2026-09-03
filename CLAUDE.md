@@ -51,7 +51,8 @@ Comportement différencié, c'est le cœur du dispositif :
 | Contexte | Comportement |
 |---|---|
 | `UPDATE_MODE=0` | Application directe — aucun conteneur n'existe encore, rien à casser. C'est là toute la valeur : les conteneurs installés juste après (Dokploy, Traefik) naissent derrière le filtre. |
-| `UPDATE_MODE=1` avec conteneurs | Liste des ports qui seraient coupés, puis `confirm` **défaut non**. Refus → `log_warn` avec la commande à lancer plus tard. |
+| `UPDATE_MODE=1`, chaîne vide, conteneurs publiant | Liste des ports qui seraient coupés, puis `confirm` **défaut non**. Refus → `log_warn` avec la commande à lancer plus tard. |
+| `UPDATE_MODE=1`, règles déjà posées | Pas de question : les ports listés sont **déjà** bloqués, un refus ne rétablirait rien (il sauterait juste une réapplication à l'identique). `log_info` + renvoi vers `docker-firewall clear`. |
 | `iptables` absent | `log_info` + retour, effectif au prochain run. |
 | Règles `DOCKER-USER` tierces | `log_warn` + retour, jamais d'écrasement. |
 
