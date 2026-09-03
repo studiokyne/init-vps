@@ -24,6 +24,82 @@ Points clés :
 - HTTP/3 = QUIC sur **UDP/443** : `step_ufw_base` ouvre `443/udp`, et `cmd_traefik_tuning` le garantit aussi (cas d'un serveur provisionné avant l'ajout de cette règle).
 - Le patch utilise `yq` (mikefarah, téléchargé si absent) et un merge profond (`eval-all ... ireduce`) pour **préserver** les middlewares gérés par Dokploy (`redirect-to-https`, `addprefix-*`, etc.). Jamais de réécriture destructive.
 
+### UFW ne filtre PAS les ports publiés par Docker (étapes 16 et 17)
+
+Le trafic vers un conteneur traverse `FORWARD` (`DOCKER-USER`, `DOCKER-FORWARD`)
+et ne passe **jamais** par les chaînes `ufw-*`. Mesuré sur un serveur réel :
+102 M de paquets dans `DOCKER-USER`, **0** dans toutes les chaînes
+`ufw-*forward`. Un `-p 0.0.0.0:PORT` est donc exposé à Internet même sans règle
+UFW, et `ufw status` n'en dit rien. Sur le serveur diagnostiqué, la seule
+protection réelle était un Hetzner Cloud Firewall — invisible depuis la machine.
+**Ne jamais raisonner comme si UFW couvrait les conteneurs.**
+
+Deux étapes distinctes en découlent, avec des rôles opposés :
+
+- `step_docker_user_firewall` (16) — **préventive**. Remplit `DOCKER-USER` :
+  RETURN sur established/related, sur 80, 443/tcp, 443/udp et les RFC1918
+  entrants par l'interface publique (route par défaut), DROP sur le reste
+  arrivant par cette interface, RETURN final. Persistance :
+  `/usr/local/lib/docker-user/apply.sh` (idempotent, `iptables -F DOCKER-USER`
+  en tête, interface redétectée à chaque exécution) + unit oneshot
+  `docker-user-rules.service` (`After=docker.service`, `RemainAfterExit=yes`).
+- `step_docker_ports_audit` (17) — **lecture seule**, aucun correctif : couper
+  un port publié en production serait plus dangereux que de le signaler.
+
+Comportement différencié, c'est le cœur du dispositif :
+
+| Contexte | Comportement |
+|---|---|
+| `UPDATE_MODE=0` | Application directe — aucun conteneur n'existe encore, rien à casser. C'est là toute la valeur : les conteneurs installés juste après (Dokploy, Traefik) naissent derrière le filtre. |
+| `UPDATE_MODE=1` avec conteneurs | Liste des ports qui seraient coupés, puis `confirm` **défaut non**. Refus → `log_warn` avec la commande à lancer plus tard. |
+| `iptables` absent | `log_info` + retour, effectif au prochain run. |
+| Règles `DOCKER-USER` tierces | `log_warn` + retour, jamais d'écrasement. |
+
+Nos règles portent toutes `-m comment --comment init-vps` : c'est **le seul**
+moyen de les distinguer de règles tierces, ne pas le retirer.
+
+⚠️ À la première installation, Docker n'est pas encore installé quand l'étape
+tourne : l'unit ne peut pas démarrer (`Requires=docker.service`), donc
+`apply.sh` est **exécuté directement**. C'est sans risque — `iptables -N` crée
+la chaîne, et le démon Docker ne vide jamais `DOCKER-USER` au démarrage.
+Déplacer cette étape après `step_dokploy` annulerait justement sa raison d'être.
+
+L'audit et le filtrage valent pour **les deux rôles** : un remote server héberge
+aussi des conteneurs.
+
+Côté vps-helper : `cmd_docker_firewall` (`status|apply|clear`, dans
+`NEED_ROOT_CMDS`) et une section « Ports publiés par Docker » dans `cmd_check`.
+`clear` est le filet de sécurité si les règles cassent un service en production.
+Le heredoc `APPLYEOF` est validé par une porte dédiée dans `lint.yml`.
+
+### `dokploy_port_is_open()` a deux sources de vérité
+
+UFW **ou** un conteneur publiant `0.0.0.0:3000->`. Ni l'une ni l'autre ne
+suffit : `$DOKPLOY_PORT_CLOSED` ignore un `ufw delete` manuel, et UFW ignore les
+ports publiés par Docker. Sur le serveur diagnostiqué, `vps-helper check`
+annonçait « Port 3000 : fermé » pendant que docker-proxy écoutait sur
+`0.0.0.0:3000`.
+
+### `configure_needrestart()` s'exécute avant l'étape 1
+
+Le réglage `nrconf{restart} = 'a'` vivait dans `step_unattended_upgrades`
+(étape 9), soit **après** le `dist-upgrade` de l'étape 1 : le premier run
+pouvait donc se bloquer sur le menu plein écran de needrestart avant d'atteindre
+la configuration censée l'éviter. La fonction est appelée depuis `main()` avant
+`step_update_system`, puis **une seconde fois à la fin de `step_update_system`**
+— cas d'un système où le paquet `needrestart` n'était pas encore installé lors
+du premier appel (le fichier de conf n'existait pas, il n'y avait rien à régler),
+alors que des paquets sont encore installés ensuite (Docker, Dokploy).
+
+### `99-network-perf.conf` — strictement quatre clés
+
+`step_sysctl_hardening` écrit un troisième fichier sysctl : `fq` + `bbr`,
+`tcp_max_syn_backlog`, `tcp_fin_timeout`. **Ne pas y ajouter `somaxconn`,
+`fs.file-max` ni `nf_conntrack_max`** : mesurés sur un serveur réel (32
+conteneurs, une semaine d'uptime), ils sont déjà bons par défaut sur Ubuntu
+24.04 — les reposer ne changerait rien et donnerait l'illusion d'un réglage
+utile.
+
 ### Rôle du serveur (`SERVER_ROLE`) — manager vs remote server
 
 `collect_server_role()` demande, tôt dans la collecte (juste après `collect_swap`, avant les questions Dokploy), si ce serveur est :
@@ -80,7 +156,8 @@ ignorer les vraies alertes, comme le redémarrage requis après un nouveau kerne
   liste commence par un blanc dès qu'une étape amont est sautée. Elle lit `$step_n` par
   portée dynamique.
 
-⚠️ **Le résumé recommande `vps-helper close-dokploy`, jamais `ufw delete allow 3000/tcp`.**
+⚠️ **Le résumé — et l'avertissement de `step_ufw_base` — recommandent
+`vps-helper close-dokploy`, jamais `ufw delete allow 3000/tcp`.**
 Les deux ferment le port, mais seul le premier persiste le choix dans `config.env` ; un
 `ufw delete` brut serait **rouvert par `step_ufw_base`** à la prochaine relance. Le résumé
 conseillait la commande brute — il conseillait donc une action que le script défaisait.

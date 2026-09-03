@@ -42,11 +42,19 @@
 #  13. MOTD personnalisé (design uniforme à la connexion SSH)
 #  14. Commande d'aide vps-helper (whitelist, ssh-keys, restart, logs, update...)
 #  15. Limitation des logs Docker (rotation 10 Mo x 3 par conteneur)
-#  16. Installation de Dokploy — uniquement si rôle = manager
-#  17. Optimisation Traefik (HTTP/3 + compression Brotli/Zstd, patch idempotent)
+#  16. Pare-feu des ports publiés par Docker (chaîne DOCKER-USER + unit
+#      systemd) — UFW ne filtre PAS ces ports ; posé avant tout conteneur à
+#      l'installation, sur confirmation en mode mise à jour
+#  17. Audit des ports publiés sur 0.0.0.0 (lecture seule, aucune correction
+#      automatique)
+#  18. Installation de Dokploy — uniquement si rôle = manager
+#  19. Optimisation Traefik (HTTP/3 + compression Brotli/Zstd, patch idempotent)
 #      — uniquement si rôle = manager
-#  18. Sauvegarde de la configuration (/etc/init-vps/config.env), pour permettre
+#  20. Sauvegarde de la configuration (/etc/init-vps/config.env), pour permettre
 #      une future relance en mode mise à jour
+#
+# (needrestart est réglé en mode automatique avant l'étape 1, pour qu'aucun
+#  prompt interactif n'interrompe le dist-upgrade.)
 #
 # Résumé final + prochaines étapes, affiché et sauvegardé dans un fichier.
 #
@@ -474,6 +482,31 @@ detect_server_ip() {
 }
 
 ###############################################################################
+# needrestart — AVANT toute installation de paquets
+###############################################################################
+# Sur Ubuntu, needrestart interrompt apt avec un menu plein écran demandant
+# quels services redémarrer. Ce réglage vivait dans step_unattended_upgrades
+# (étape 9), soit APRÈS le dist-upgrade de l'étape 1 : le premier run pouvait
+# donc se bloquer sur ce prompt avant même d'avoir atteint la configuration
+# censée l'éviter. Appelée depuis main() avant step_update_system.
+# Idempotente : le fichier est corrigé s'il existe, la ligne ajoutée sinon —
+# rejouer en mode mise à jour ne duplique rien.
+configure_needrestart() {
+    local conf=/etc/needrestart/needrestart.conf
+    if [[ ! -f "$conf" ]]; then
+        # Pas encore installé (le paquet fait partie de step_update_system) :
+        # rien à régler, et rien à interrompre non plus.
+        return 0
+    fi
+    if grep -q "nrconf{restart}" "$conf" 2>/dev/null; then
+        sed -i "s/.*nrconf{restart}.*/\$nrconf{restart} = 'a';/" "$conf"
+    else
+        echo "\$nrconf{restart} = 'a';" >> "$conf"
+    fi
+    log_info "needrestart en mode automatique (pas de prompt interactif pendant apt)."
+}
+
+###############################################################################
 # 1. MISE À JOUR SYSTÈME
 ###############################################################################
 step_update_system() {
@@ -483,6 +516,10 @@ step_update_system() {
     apt-get dist-upgrade -y
     apt-get install -y curl wget gnupg ca-certificates software-properties-common \
         ufw fail2ban unattended-upgrades update-notifier-common needrestart htop openssl
+    # Cas d'un système où needrestart n'était pas installé : main() l'a appelée
+    # avant, sans fichier à régler. On rattrape ici, avant l'autoremove et les
+    # étapes suivantes qui installent encore des paquets (Docker, Dokploy).
+    configure_needrestart
     apt-get autoremove --purge -y
     log_ok "Système à jour."
 }
@@ -655,7 +692,7 @@ step_ufw_base() {
         ufw allow from "$DOKPLOY_RESTRICT_IP" to any port 3000 proto tcp comment 'Dokploy UI (IP restreinte)' >/dev/null
     else
         ufw allow 3000/tcp comment 'Dokploy UI - a fermer manuellement apres config domaine' >/dev/null
-        log_warn "Port 3000 ouvert à tous. Fermeture manuelle requise une fois le domaine et le TLS configurés dans Dokploy (ufw delete allow 3000/tcp)."
+        log_warn "Port 3000 ouvert à tous. Fermeture requise une fois le domaine et le TLS configurés dans Dokploy (sudo vps-helper close-dokploy)."
     fi
 
     ufw --force enable >/dev/null
@@ -756,12 +793,6 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
 
-    if grep -q "nrconf{restart}" /etc/needrestart/needrestart.conf 2>/dev/null; then
-        sed -i "s/.*nrconf{restart}.*/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
-    else
-        echo "\$nrconf{restart} = 'a';" >> /etc/needrestart/needrestart.conf
-    fi
-
     systemctl enable unattended-upgrades >/dev/null 2>&1
     systemctl restart unattended-upgrades
     log_ok "Mises à jour de sécurité automatiques configurées (sans reboot auto)."
@@ -774,6 +805,7 @@ step_sysctl_hardening() {
     log_step "Durcissement sysctl (réseau + mémoire)"
     backup_file /etc/sysctl.d/99-hardening.conf
     backup_file /etc/sysctl.d/99-memory.conf
+    backup_file /etc/sysctl.d/99-network-perf.conf
     cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
 # Anti spoofing
 net.ipv4.conf.all.rp_filter = 1
@@ -828,6 +860,27 @@ vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 EOF
 
+    # Performances reseau. Volontairement limite a ces quatre cles : somaxconn,
+    # fs.file-max et nf_conntrack_max ont ete mesures sur un serveur reel
+    # (32 conteneurs, une semaine d'uptime) et sont deja bons par defaut sur
+    # Ubuntu 24.04 — les reposer n'apporterait rien et donnerait l'illusion
+    # d'un reglage utile.
+    cat > /etc/sysctl.d/99-network-perf.conf <<'EOF'
+# BBR + fq : controle de congestion nettement meilleur que cubic sur des
+# liaisons longue distance (visiteurs lointains, sauvegardes hors site).
+# fq est l'ordonnanceur attendu par BBR ; les deux vont ensemble.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# File d'attente des connexions a demi ouvertes : la valeur par defaut est
+# vite atteinte sur un hote qui publie plusieurs dizaines de services.
+net.ipv4.tcp_max_syn_backlog = 4096
+
+# Sockets en FIN-WAIT-2 liberees plus vite (60 s par defaut) : un reverse
+# proxy ouvre et ferme beaucoup de connexions courtes.
+net.ipv4.tcp_fin_timeout = 15
+EOF
+
     # Migration : ces deux clés vivaient dans 99-swap.conf, écrit par step_swap.
     # Sur un serveur déjà provisionné, le laisser donnerait deux sources de
     # vérité pour les mêmes réglages. Valeurs identiques, donc suppression sans
@@ -841,7 +894,7 @@ EOF
     # --system charge tous les fichiers ; on ignore les clés IPv6 absentes si
     # l'IPv6 est désactivé au boot (sysctl --system n'échoue pas là-dessus).
     sysctl --system >/dev/null 2>&1 || sysctl --system >/dev/null
-    log_ok "Durcissement sysctl appliqué (réseau IPv4/IPv6 + mémoire)."
+    log_ok "Durcissement sysctl appliqué (réseau IPv4/IPv6 + mémoire + performances réseau)."
 }
 
 ###############################################################################
@@ -1031,7 +1084,7 @@ chk_fail() { printf '%b %s\n' "${C_RED}[FAIL]${C_RESET}" "$1"; }
 chk_info() { printf '%b %s\n' "${C_CYAN}[INFO]${C_RESET}" "$1"; }
 chk_sect() { printf '\n%b%s%b\n' "${C_DIM}── " "$1" " ────────────────────────────────────────${C_RESET}"; }
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys"
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -1057,6 +1110,10 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper update${C_RESET}              Mettre à jour le système (sécurité incluse)
   ${C_CYAN}vps-helper check${C_RESET}               Vérifier l'état du durcissement (lecture seule)
   ${C_CYAN}vps-helper traefik-tuning${C_RESET}      Activer HTTP/3 + compression Traefik (idempotent)
+  ${C_CYAN}vps-helper docker-firewall <action>${C_RESET}
+                                 Filtrage des ports publiés par Docker (DOCKER-USER)
+                                 status : état et ports exposés · apply : (re)poser
+                                 les règles · clear : les retirer
   ${C_CYAN}vps-helper version${C_RESET}             Afficher la version de init-vps.sh utilisée
   ${C_CYAN}vps-helper help${C_RESET}                Afficher cette aide
 EOF
@@ -1462,6 +1519,110 @@ FRAGEOF
     fi
 }
 
+# --- Ports publiés par Docker / chaîne DOCKER-USER --------------------------
+# UFW ne filtre PAS les ports publiés par Docker : leur trafic traverse
+# FORWARD (DOCKER-USER, DOCKER-FORWARD) sans passer par les chaînes ufw-*.
+# Ces trois fonctions servent à la fois à `check` et à `docker-firewall`.
+DOCKER_USER_APPLY=/usr/local/lib/docker-user/apply.sh
+
+# Un « port/proto » par ligne, dédoublonné. `done < <(...)` et non un pipe :
+# la boucle doit tourner dans le shell courant.
+docker_published_public_ports() {
+    command -v docker >/dev/null 2>&1 || return 0
+    local line chunk hostport proto
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local -a chunks=()
+        IFS=',' read -ra chunks <<< "$line"
+        for chunk in "${chunks[@]}"; do
+            chunk="${chunk// /}"
+            [[ "$chunk" == *'->'* ]] || continue
+            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* ]] || continue
+            hostport="${chunk%%->*}"
+            hostport="${hostport##*:}"
+            proto="${chunk##*/}"
+            echo "${hostport}/${proto}"
+        done
+    done < <(docker ps --format '{{.Ports}}' 2>/dev/null) | sort -u
+}
+
+docker_user_rules() {
+    iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true
+}
+
+docker_user_chain_is_empty() {
+    [ -z "$(docker_user_rules)" ]
+}
+
+docker_user_rule_count() {
+    docker_user_rules | grep -c '^-A' || true
+}
+
+cmd_docker_firewall() {
+    local action="${1:-status}"
+
+    if ! command -v iptables >/dev/null 2>&1; then
+        err "iptables introuvable — impossible de piloter la chaîne DOCKER-USER."
+        exit 1
+    fi
+
+    case "$action" in
+        status)
+            printf '\n%b\n' "${C_BOLD}Filtrage des ports publiés par Docker${C_RESET}"
+            if docker_user_chain_is_empty; then
+                warn "Chaîne DOCKER-USER vide : les ports publiés par les conteneurs ne sont filtrés par rien sur ce serveur (UFW ne les voit pas)."
+                info "La protection ne dépend alors que d'un éventuel pare-feu externe (Hetzner Cloud Firewall & assimilés), invisible depuis ici."
+                info "Poser les règles : vps-helper docker-firewall apply"
+            else
+                ok "Chaîne DOCKER-USER remplie ($(docker_user_rule_count) règle(s))."
+                docker_user_rules | sed 's/^/    /'
+            fi
+            if systemctl is-enabled docker-user-rules.service >/dev/null 2>&1; then
+                ok "Unit docker-user-rules.service activée (règles réappliquées au démarrage)."
+            else
+                warn "Unit docker-user-rules.service non activée : les règles ne survivront pas à un redémarrage."
+            fi
+            printf '\n%b\n' "${C_BOLD}Ports publiés sur 0.0.0.0${C_RESET}"
+            local published found=0
+            while IFS= read -r published; do
+                [ -z "$published" ] && continue
+                found=1
+                case "$published" in
+                    80/tcp|443/tcp|443/udp) info "  ${published} (autorisé par les règles)" ;;
+                    *)                      warn "  ${published} (bloqué depuis Internet si les règles sont posées)" ;;
+                esac
+            done < <(docker_published_public_ports)
+            [ "$found" -eq 0 ] && info "  aucun"
+            ;;
+        apply)
+            if [ ! -x "$DOCKER_USER_APPLY" ]; then
+                err "${DOCKER_USER_APPLY} introuvable — relancer init-vps.sh (mode mise à jour) pour l'installer."
+                exit 1
+            fi
+            if ! docker_user_chain_is_empty && ! docker_user_rules | grep -q -- '--comment init-vps'; then
+                err "La chaîne DOCKER-USER contient des règles qui ne viennent pas d'init-vps — application refusée pour ne pas les écraser."
+                docker_user_rules | sed 's/^/    /'
+                exit 1
+            fi
+            "$DOCKER_USER_APPLY"
+            systemctl enable docker-user-rules.service >/dev/null 2>&1 || true
+            ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp et réseaux privés autorisés ; le reste bloqué)."
+            ;;
+        clear)
+            # Filet de sécurité : si les règles cassent un service, on revient
+            # à l'état d'origine (chaîne vide) sans avoir à relancer le script.
+            iptables -F DOCKER-USER 2>/dev/null || true
+            systemctl disable docker-user-rules.service >/dev/null 2>&1 || true
+            warn "Chaîne DOCKER-USER vidée et unit désactivée : les ports publiés par Docker ne sont plus filtrés localement."
+            info "Les reposer : vps-helper docker-firewall apply"
+            ;;
+        *)
+            err "Action inconnue : « ${action} » (attendu : status, apply ou clear)."
+            exit 1
+            ;;
+    esac
+}
+
 cmd_check() {
     local pass=0 fail=0
 
@@ -1520,6 +1681,25 @@ cmd_check() {
         chk_pass "Rotation des logs Docker configurée (max-size présent)"; pass=$((pass+1))
     else
         chk_fail "Rotation des logs Docker non configurée (/etc/docker/daemon.json absent ou sans max-size)"; fail=$((fail+1))
+    fi
+
+    chk_sect "Ports publiés par Docker"
+    local port_found=0 published
+    while IFS= read -r published; do
+        [ -z "$published" ] && continue
+        case "$published" in 80/tcp|443/tcp|443/udp) continue ;; esac
+        chk_fail "Port ${published} publié sur 0.0.0.0 (exposé si DOCKER-USER ne le filtre pas)"; fail=$((fail+1))
+        port_found=1
+    done < <(docker_published_public_ports)
+    if [ "$port_found" -eq 0 ]; then
+        chk_pass "Aucun port publié sur 0.0.0.0 en dehors de 80/443"; pass=$((pass+1))
+    fi
+    if ! command -v iptables >/dev/null 2>&1; then
+        chk_info "DOCKER-USER : iptables absent, état non vérifiable"
+    elif docker_user_chain_is_empty; then
+        chk_info "DOCKER-USER : vide — UFW ne filtre pas les ports publiés par Docker, la protection dépend d'un pare-feu externe (corriger : vps-helper docker-firewall apply)"
+    else
+        chk_info "DOCKER-USER : $(docker_user_rule_count) règle(s) — filtrage actif des ports publiés"
     fi
 
     chk_sect "Traefik (HTTP/3 + compression)"
@@ -1589,6 +1769,7 @@ case "$CMD" in
     update)         cmd_update ;;
     check)          cmd_check ;;
     traefik-tuning) cmd_traefik_tuning ;;
+    docker-firewall) shift; cmd_docker_firewall "$@" ;;
     version)        cmd_version ;;
     help|--help|-h) print_help ;;
     *)
@@ -1640,7 +1821,224 @@ EOF
 }
 
 ###############################################################################
-# 16. INSTALLATION DOKPLOY
+# 16. PARE-FEU DES PORTS PUBLIÉS PAR DOCKER (chaîne DOCKER-USER)
+###############################################################################
+# UFW ne filtre PAS les ports publiés par Docker : le trafic vers un conteneur
+# traverse FORWARD (DOCKER-USER, DOCKER-FORWARD) sans jamais passer par les
+# chaînes ufw-*. Mesuré en production : 102M paquets vus par DOCKER-USER,
+# 0 par toutes les chaînes ufw-*forward. Sans pare-feu externe (Hetzner Cloud
+# Firewall & assimilés, invisibles depuis le serveur), tout « -p 0.0.0.0:PORT »
+# est donc exposé à Internet, sans que rien ne le signale.
+#
+# DOCKER-USER est le point d'accroche officiel prévu par Docker : il est
+# évalué avant les règles générées par le démon, survit aux redémarrages, et
+# — contrairement à ufw-docker — ne casse ni l'ingress Swarm ni
+# docker_gwbridge, puisqu'on ne DROP que ce qui entre par l'interface publique.
+#
+# L'étape est préventive : à la première installation aucun conteneur n'existe
+# encore, il n'y a donc rien à casser. En mode mise à jour, couper un port
+# publié en production est un risque réel — on demande confirmation.
+DOCKER_USER_DIR=/usr/local/lib/docker-user
+DOCKER_USER_APPLY="${DOCKER_USER_DIR}/apply.sh"
+DOCKER_USER_UNIT=/etc/systemd/system/docker-user-rules.service
+
+# Ports publiés sur 0.0.0.0 / [::], un « port/proto » par ligne, dédoublonnés.
+# `done < <(...)` et non un pipe : la boucle doit s'exécuter dans le shell
+# courant, pas dans un sous-shell.
+docker_published_public_ports() {
+    command -v docker &>/dev/null || return 0
+    local line chunk hostport proto
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local -a chunks=()
+        IFS=',' read -ra chunks <<< "$line"
+        for chunk in "${chunks[@]}"; do
+            chunk="${chunk// /}"
+            [[ "$chunk" == *'->'* ]] || continue
+            [[ "$chunk" == 0.0.0.0:* || "$chunk" == '[::]:'* ]] || continue
+            hostport="${chunk%%->*}"
+            hostport="${hostport##*:}"
+            proto="${chunk##*/}"
+            echo "${hostport}/${proto}"
+        done
+    done < <(docker ps --format '{{.Ports}}' 2>/dev/null) | sort -u
+}
+
+# Règles posées par init-vps ? Elles portent toutes le commentaire iptables
+# « init-vps », ce qui permet de les distinguer de règles tierces.
+docker_user_has_foreign_rules() {
+    local rules
+    rules="$(iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true)"
+    [[ -n "$rules" ]] && ! grep -q -- '--comment init-vps' <<< "$rules"
+}
+
+docker_user_is_empty() {
+    local rules
+    rules="$(iptables -S DOCKER-USER 2>/dev/null | grep -v '^-N ' || true)"
+    [[ -z "$rules" ]]
+}
+
+step_docker_user_firewall() {
+    log_step "Pare-feu des ports publiés par Docker (DOCKER-USER)"
+
+    if ! command -v iptables &>/dev/null; then
+        log_info "iptables absent (Docker pas encore installé) : étape reportée au prochain lancement."
+        return
+    fi
+
+    # Le script et l'unit sont toujours (ré)écrits : sans activation ils sont
+    # inertes, et les avoir sur disque permet de pointer une commande réelle
+    # à l'utilisateur quand l'application est refusée ou bloquée.
+    install -d -m 0755 "$DOCKER_USER_DIR"
+    backup_file "$DOCKER_USER_APPLY"
+    cat > "$DOCKER_USER_APPLY" <<'APPLYEOF'
+#!/usr/bin/env bash
+# Généré par init-vps.sh — ne pas éditer à la main (réécrit à chaque exécution).
+# Remplit la chaîne DOCKER-USER, évaluée par Docker AVANT ses propres règles
+# de forwarding : c'est le seul endroit qui filtre réellement les ports
+# publiés par les conteneurs (UFW, lui, ne les voit pas).
+set -euo pipefail
+
+# Interface publique = celle de la route par défaut. Détectée à chaque
+# exécution (et non figée à l'installation) pour survivre à un changement de
+# nom d'interface ou de route.
+IFACE="$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit }}')"
+if [ -z "$IFACE" ]; then
+    echo "docker-user: aucune route par défaut, interface publique introuvable — aucune règle appliquée." >&2
+    exit 0
+fi
+
+COMMENT=(-m comment --comment init-vps)
+
+# Idempotence : la chaîne est vidée avant d'être réécrite.
+iptables -N DOCKER-USER 2>/dev/null || true
+iptables -F DOCKER-USER
+
+# Réponses aux connexions sortantes des conteneurs.
+iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED "${COMMENT[@]}" -j RETURN
+
+# Services web publics.
+iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 80 "${COMMENT[@]}" -j RETURN
+iptables -A DOCKER-USER -i "$IFACE" -p tcp --dport 443 "${COMMENT[@]}" -j RETURN
+iptables -A DOCKER-USER -i "$IFACE" -p udp --dport 443 "${COMMENT[@]}" -j RETURN
+
+# Réseaux privés (réseau interne du provider, VPN, autres nœuds Swarm).
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    iptables -A DOCKER-USER -i "$IFACE" -s "$net" "${COMMENT[@]}" -j RETURN
+done
+
+# Tout le reste venant de l'extérieur est rejeté. Le trafic qui n'entre pas
+# par l'interface publique (conteneur à conteneur, docker_gwbridge, ingress
+# Swarm) n'atteint jamais ce DROP.
+iptables -A DOCKER-USER -i "$IFACE" "${COMMENT[@]}" -j DROP
+iptables -A DOCKER-USER "${COMMENT[@]}" -j RETURN
+APPLYEOF
+    chmod +x "$DOCKER_USER_APPLY"
+
+    backup_file "$DOCKER_USER_UNIT"
+    cat > "$DOCKER_USER_UNIT" <<'UNITEOF'
+[Unit]
+Description=Regles iptables DOCKER-USER (init-vps)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/docker-user/apply.sh
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+    systemctl daemon-reload
+
+    if docker_user_has_foreign_rules; then
+        log_warn "La chaîne DOCKER-USER contient déjà des règles qui ne viennent pas d'init-vps : rien n'est appliqué pour ne pas les écraser."
+        log_warn "Les inspecter (« iptables -S DOCKER-USER »), puis, si elles sont remplaçables : systemctl enable --now docker-user-rules.service"
+        return
+    fi
+
+    # Première installation : aucun conteneur ne tourne, le risque est nul.
+    # Mode mise à jour : lister d'abord ce que les règles couperaient.
+    if [[ "$UPDATE_MODE" -eq 1 ]]; then
+        local -a cut_ports=()
+        local p
+        while IFS= read -r p; do
+            [[ -z "$p" ]] && continue
+            case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
+            cut_ports+=("$p")
+        done < <(docker_published_public_ports)
+
+        if [[ "${#cut_ports[@]}" -gt 0 ]]; then
+            log_warn "Des conteneurs publient des ports qui deviendraient inaccessibles depuis Internet :"
+            for p in "${cut_ports[@]}"; do
+                log_warn "    - ${p}"
+            done
+            log_info "Ces ports resteraient joignables depuis les réseaux privés (10/8, 172.16/12, 192.168/16)."
+            if ! confirm "Appliquer quand même les règles DOCKER-USER ?" "n"; then
+                log_warn "Règles non appliquées. Pour le faire plus tard : sudo systemctl enable --now docker-user-rules.service"
+                return
+            fi
+        fi
+    fi
+
+    systemctl enable docker-user-rules.service >/dev/null 2>&1 || true
+
+    # À la première installation, Docker n'est pas encore là : l'unit ne peut
+    # pas démarrer (Requires=docker.service) mais la chaîne, elle, peut déjà
+    # être remplie — iptables -N la crée, et le démon Docker ne vide jamais
+    # DOCKER-USER au démarrage. C'est précisément l'intérêt de poser ces
+    # règles maintenant : les conteneurs installés juste après (Dokploy,
+    # Traefik) naissent déjà derrière le filtre, sans fenêtre d'exposition.
+    if systemctl list-unit-files docker.service >/dev/null 2>&1 \
+        && systemctl list-unit-files docker.service 2>/dev/null | grep -q '^docker\.service'; then
+        # `restart` et non `start` : avec RemainAfterExit, une unit déjà
+        # active ne rejouerait pas le script et les règles ne seraient pas
+        # rafraîchies.
+        systemctl restart docker-user-rules.service
+    else
+        "$DOCKER_USER_APPLY"
+    fi
+    log_ok "Règles DOCKER-USER appliquées (80, 443/tcp, 443/udp et réseaux privés autorisés ; le reste bloqué)."
+}
+
+###############################################################################
+# 17. AUDIT DES PORTS PUBLIÉS PAR DOCKER (lecture seule)
+###############################################################################
+# Purement informatif : aucune correction automatique. Couper un port publié
+# sur un serveur en production serait plus dangereux que de le signaler — la
+# décision revient à l'exploitant. Sans valeur à la première installation
+# (aucun conteneur n'existe), l'étape prend son sens en mode mise à jour et
+# via « vps-helper check ».
+step_docker_ports_audit() {
+    log_step "Audit des ports publiés par Docker"
+
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker absent, aucun port à auditer."
+        return
+    fi
+
+    local found=0 p
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        case "$p" in 80/tcp|443/tcp|443/udp) continue ;; esac
+        log_warn "Port ${p} publié sur 0.0.0.0 (toutes interfaces)."
+        found=1
+    done < <(docker_published_public_ports)
+
+    if [[ "$found" -eq 0 ]]; then
+        log_ok "Aucun port publié sur 0.0.0.0 en dehors de 80/443."
+    else
+        log_info "Aucune correction automatique : arbitrer port par port (publier sur 127.0.0.1 plutôt que 0.0.0.0, ou laisser DOCKER-USER filtrer)."
+    fi
+
+    if command -v iptables &>/dev/null && docker_user_is_empty; then
+        log_warn "La chaîne DOCKER-USER est vide : UFW ne filtrant pas les ports publiés par Docker, la protection ne dépend plus que d'un éventuel pare-feu externe (Hetzner Cloud Firewall & assimilés), invisible depuis ce serveur."
+    fi
+}
+
+###############################################################################
+# 18. INSTALLATION DOKPLOY
 ###############################################################################
 # Pré-installe Docker avant Dokploy. L'install.sh de Dokploy délègue à
 # get.docker.com, qui déduit le nom de code APT depuis /etc/os-release : sur une
@@ -1726,7 +2124,7 @@ step_dokploy() {
 }
 
 ###############################################################################
-# 17. OPTIMISATION TRAEFIK (HTTP/3 + compression) — patch idempotent
+# 19. OPTIMISATION TRAEFIK (HTTP/3 + compression) — patch idempotent
 #
 # Active HTTP/3 et une compression Brotli/Zstd/gzip sur la config Traefik gérée
 # par Dokploy. La logique réelle vit dans vps-helper (cmd_traefik_tuning) : on
@@ -1748,7 +2146,7 @@ step_traefik_tuning() {
 }
 
 ###############################################################################
-# 18. SAUVEGARDE DE L'ÉTAT — pour le mode mise à jour (--update)
+# 20. SAUVEGARDE DE L'ÉTAT — pour le mode mise à jour (--update)
 ###############################################################################
 # Persiste la configuration collectée pour permettre de relancer le script
 # plus tard en mode mise à jour (rejoue les steps idempotents sans reposer
@@ -1799,11 +2197,19 @@ dokploy_has_tls_domain() {
     grep -q '"main"[[:space:]]*:' "$acme" 2>/dev/null
 }
 
-# Le port 3000 est-il encore ouvert dans UFW ? On interroge l'état réel plutôt
-# que $DOKPLOY_PORT_CLOSED : ce dernier ne connaît que les fermetures faites
-# via `vps-helper close-dokploy`, pas un `ufw delete` lancé à la main.
+# Le port 3000 est-il encore joignable ? Deux sources de vérité, car aucune ne
+# suffit seule :
+#   - UFW, interrogé plutôt que $DOKPLOY_PORT_CLOSED : cette variable ne connaît
+#     que les fermetures faites via `vps-helper close-dokploy`, pas un
+#     `ufw delete` lancé à la main.
+#   - les ports publiés par Docker : UFW ne les filtre pas (leur trafic passe
+#     par DOCKER-USER/DOCKER-FORWARD, jamais par les chaînes ufw-*). Sur un
+#     serveur réel, `check` annonçait « port 3000 fermé » alors que docker-proxy
+#     écoutait sur 0.0.0.0:3000 — la règle UFW avait été supprimée, le port
+#     restait bel et bien exposé.
 dokploy_port_is_open() {
-    ufw status 2>/dev/null | grep -q '3000/tcp'
+    ufw status 2>/dev/null | grep -q '3000/tcp' && return 0
+    docker_published_public_ports 2>/dev/null | grep -qx '3000/tcp'
 }
 
 # Sépare deux étapes par une ligne vide, sauf avant la première : sinon la
@@ -2033,6 +2439,8 @@ main() {
     # chaque fois (déjà couvert par unattended-upgrades / vps-helper update) —
     # le mode mise à jour est documenté comme une réapplication légère de la
     # config (MOTD, vps-helper, durcissement...), pas une maintenance système.
+    configure_needrestart
+
     if [[ "$update_mode" -eq 0 ]]; then
         step_update_system
     else
@@ -2052,6 +2460,10 @@ main() {
     step_motd
     step_vps_helper
     step_docker_log_limits
+    # Les deux rôles publient des conteneurs : le filtrage DOCKER-USER et
+    # l'audit des ports valent pour un manager comme pour un remote server.
+    step_docker_user_firewall
+    step_docker_ports_audit
     if [[ "$SERVER_ROLE" == "1" ]]; then
         step_dokploy
         step_traefik_tuning

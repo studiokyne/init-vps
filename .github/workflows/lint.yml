@@ -38,3 +38,9 @@ jobs:
           awk "/cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" init-vps.sh > /tmp/helper_check.sh
           [ -s /tmp/helper_check.sh ] || { echo "::error::Extraction du heredoc vps-helper vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
           bash -n /tmp/helper_check.sh && echo "vps-helper heredoc syntax OK"
+
+      - name: Extract and check embedded DOCKER-USER heredoc
+        run: |
+          awk "/cat > \"\\\$DOCKER_USER_APPLY\" <<'APPLYEOF'/{p=1;next} /^APPLYEOF$/{p=0} p" init-vps.sh > /tmp/docker_user_check.sh
+          [ -s /tmp/docker_user_check.sh ] || { echo "::error::Extraction du heredoc DOCKER-USER vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
+          bash -n /tmp/docker_user_check.sh && echo "DOCKER-USER heredoc syntax OK"
