@@ -44,3 +44,12 @@ jobs:
           awk "/cat > \"\\\$DOCKER_USER_APPLY\" <<'APPLYEOF'/{p=1;next} /^APPLYEOF$/{p=0} p" init-vps.sh > /tmp/docker_user_check.sh
           [ -s /tmp/docker_user_check.sh ] || { echo "::error::Extraction du heredoc DOCKER-USER vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
           bash -n /tmp/docker_user_check.sh && echo "DOCKER-USER heredoc syntax OK"
+
+      # vps-notify. Motif ancré sur la fin de ligne `<<'NOTIFYEOF'` (et non sur
+      # le `cat > chemin` qui précède) : le heredoc est indenté dans
+      # step_notify, et `[ -s ]` garde détectable une extraction vide.
+      - name: Extract and check embedded vps-notify heredoc
+        run: |
+          awk "/<<'NOTIFYEOF'\$/{p=1;next} /^NOTIFYEOF\$/{p=0} p" init-vps.sh > /tmp/notify_check.sh
+          [ -s /tmp/notify_check.sh ] || { echo "::error::Extraction du heredoc vps-notify vide — le motif awk ne matche plus init-vps.sh"; exit 1; }
+          bash -n /tmp/notify_check.sh && echo "vps-notify heredoc syntax OK"

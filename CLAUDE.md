@@ -4,10 +4,14 @@
 
 Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour être installable en une seule commande `curl | bash` ou `curl -o ... && bash`. **Ne jamais le scinder en plusieurs fichiers sourcés.**
 
-À l'exécution, `init-vps.sh` génère deux sous-scripts sur le serveur cible via des heredocs :
+À l'exécution, `init-vps.sh` génère des sous-scripts sur le serveur cible via des heredocs :
 
 - **MOTD** (`/etc/update-motd.d/00-studiokyne`) — délimité par `MOTDEOF`
 - **vps-helper** (`/usr/local/bin/vps-helper`) — délimité par `HELPEREOF`
+- **apply.sh** (`/usr/local/lib/docker-user/apply.sh`) — délimité par `APPLYEOF`
+- **vps-notify** (`/usr/local/bin/vps-notify`) — délimité par `NOTIFYEOF`
+
+Chaque heredoc a sa porte d'extraction + `bash -n` dans `lint.yml`. Tout nouveau heredoc en ajoute une.
 
 Les deux heredocs utilisent des délimiteurs **entre guillemets simples** (`<<'MOTDEOF'`, `<<'HELPEREOF'`), ce qui signifie qu'aucune variable du script parent n'est interpolée à l'intérieur — à l'exception de `SCRIPT_VERSION` et `DEFAULT_ADMIN_USER` dans `HELPEREOF`, injectées via deux `sed -i` après l'écriture du fichier (voir `step_vps_helper`).
 
@@ -101,14 +105,168 @@ la configuration censée l'éviter. La fonction est appelée depuis `main()` ava
 du premier appel (le fichier de conf n'existait pas, il n'y avait rien à régler),
 alors que des paquets sont encore installés ensuite (Docker, Dokploy).
 
-### `99-network-perf.conf` — strictement quatre clés
+### `99-network-perf.conf` — liste fermée
 
 `step_sysctl_hardening` écrit un troisième fichier sysctl : `fq` + `bbr`,
-`tcp_max_syn_backlog`, `tcp_fin_timeout`. **Ne pas y ajouter `somaxconn`,
-`fs.file-max` ni `nf_conntrack_max`** : mesurés sur un serveur réel (32
-conteneurs, une semaine d'uptime), ils sont déjà bons par défaut sur Ubuntu
-24.04 — les reposer ne changerait rien et donnerait l'illusion d'un réglage
-utile.
+`tcp_max_syn_backlog`, `tcp_fin_timeout`, et `rmem_max`/`wmem_max` à 7 500 000
+(tampons UDP pour HTTP/3). Ces deux derniers sont une **marge préventive non
+démontrée** (aucun warning quic-go observé) : le commentaire le dit, ne pas le
+présenter comme un correctif de performance. **Ne pas y ajouter `somaxconn`,
+`fs.file-max`, `nf_conntrack_max` ni `tcp_tw_reuse`** : mesurés sur des serveurs
+réels (jusqu'à 46 conteneurs), ils sont déjà bons par défaut sur Ubuntu 24.04.
+
+Même logique pour `99-hardening.conf` : seul `tcp_rfc1337` a été ajouté (mesuré
+à 0). **Ne pas ajouter `kptr_restrict`, `dmesg_restrict`, `ptrace_scope`,
+`unprivileged_bpf_disabled` ni `fs.protected_*`** — déjà durcis par défaut.
+
+### sysctl : écrire ne suffit pas, on relit
+
+Mesuré en production : `log_martians = 1` dans `99-hardening.conf`, **0** au
+runtime. Cause : UFW réapplique `/etc/ufw/sysctl.conf` à chaque enable/reload —
+donc au boot, **après** systemd-sysctl — et ce fichier pose `log_martians=0`.
+L'ancien `sysctl --system >/dev/null 2>&1 || …` avalait par ailleurs toute erreur.
+
+- `sysctl_align_ufw` aligne, dans `/etc/ufw/sysctl.conf`, **uniquement** les clés
+  que nous gérons (backup avant, reste du fichier intact).
+- `sysctl_apply` journalise chaque ligne `sysctl:` en erreur.
+- `sysctl_verify` relit chaque clé au runtime et nomme le fichier qui l'écrase.
+- `check_sysctl` (vps-helper) refait la même comparaison. La liste des fichiers
+  (`SYSCTL_INIT_VPS_FILES`) est **dupliquée** parent / `HELPEREOF` : les garder
+  synchronisées.
+
+⚠️ Vérifier juste après `sysctl --system` ne voit **pas** l'écrasement par UFW
+(il n'a lieu qu'au boot) : c'est pour ça que l'alignement du fichier UFW existe,
+et que `check` compare au runtime réel du serveur.
+
+### fail2ban : `recidive` doit lire un fichier, et les bans sont dans nftables
+
+`[DEFAULT] backend = systemd` se propage à **toutes** les jails. `recidive`
+cherchait donc les bans dans le journal, alors que fail2ban les écrit dans
+`/var/log/fail2ban.log` — mesuré : 18 bans sshd, `Total failed: 0` sur recidive
+depuis l'installation. Sa section porte maintenant `backend = auto` +
+`logpath = /var/log/fail2ban.log`. **Ne jamais retirer ces deux lignes.**
+
+`check_fail2ban_recidive` ne se contente plus de « jail active » : FAIL si la
+jail ne lit pas `fail2ban.log`, FAIL si des bans (non `Restore`) ont été écrits
+depuis le démarrage de fail2ban sans que son compteur bouge, INFO « non
+vérifiable » s'il n'y a eu aucun ban.
+
+`check_fail2ban_bans` interroge `nft list ruleset` **et** `iptables -S` : avec
+banaction nftables (défaut 24.04), fail2ban crée `inet f2b-table`, invisible
+depuis la vue iptables — même en iptables-nft.
+
+### `vps-helper check` — mémoire des conteneurs
+
+Deux mécanismes, deux sources, **les deux** sont nécessaires :
+
+- **OOM kill** → journal noyau. `kernel_log` lit `journalctl -k -b` avant
+  `dmesg` : le tampon circulaire de dmesg tourne vite sur un hôte chargé, un OOM
+  ancien en sort et « aucun OOM » deviendrait un faux PASS. Les IDs de
+  `task_memcg=` sont résolus en noms de conteneurs.
+- **Throttling** → **invisible** dans le journal. Seul le compteur `max` de
+  `memory.events` (cgroup v2) le rapporte. Mesuré : 35 652 fois sur un conteneur
+  « Up (healthy) ».
+
+⚠️ Les compteurs de `memory.events` **repartent à zéro à chaque recréation**.
+Un compteur non nul est concluant quel que soit l'âge ; un `max 0` sur un
+conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
+« non concluant », **jamais PASS**. Un faux négatif ici est pire que pas de check.
+`memory.peak` ≥ 90 % de `memory.max` → WARN (alerte précoce). Un conteneur sans
+limite (`max`) n'est pas « throttlable » : il est seulement compté.
+
+Les fonctions `check_*` incrémentent `pass`/`fail` de `cmd_check` par portée
+dynamique ; `chk_fail` mémorise aussi le message dans `CHK_FAIL_MSGS` (utilisé
+par `--notify`), `chk_warn` compte les avertissements sans faire échouer.
+
+### Port SSH (`SSH_PORT`) — configurable, changement sans verrouillage
+
+`SSH_PORT` n'est plus une constante : `collect_ssh_port`, persisté dans
+`config.env`, répercuté sur fail2ban, UFW, le résumé. Principe identique aux
+phases 1/2 : **écouter sur l'ancien ET le nouveau port**, tester dans un autre
+terminal, puis fermer l'ancien.
+
+- Phase 1 écrit un `Port` par port actuel + `$SSH_PORT` ; `step_ufw_base` laisse
+  ouvert (commentaire `SSH (transition de port)`) tout port où sshd écoute encore.
+- Phase 2 écrit le seul `$SSH_PORT` et appelle `ssh_close_old_ports`.
+- Serveur **déjà verrouillé** : `ssh_port_migration`. Un refus ne quitte pas le
+  script, il revient à l'ancien port (`ssh_revert_port` réaligne UFW, fail2ban
+  et `$SSH_PORT`, que `step_save_state` persistera).
+- `write_sshd_final_config` est la **seule** source du contenu verrouillé.
+
+⚠️ Ubuntu 24.04 : sshd est **activé par socket**, et le port d'écoute vient d'un
+générateur systemd qui ne relit `sshd_config` qu'au `daemon-reload`. Un
+`systemctl restart ssh` seul garde l'ancien port. `ssh_restart` fait
+`daemon-reload`, stoppe `ssh.service` (systemd refuse de redémarrer un socket
+dont le service tourne), redémarre `ssh.socket`, relance le service, puis
+**vérifie avec `ss`** l'écoute sur chaque port attendu.
+
+### Notifications (étape 20) — `vps-notify`
+
+Pas de système d'alerte parallèle : le webhook est branché sur ce qui détecte
+déjà tout, `vps-helper check --notify` (timer quotidien `vps-check.timer`), plus
+`OnFailure=vps-notify-failure@%n.service` sur `apt-daily-upgrade.service`.
+
+- `vps-notify` (heredoc `NOTIFYEOF`, porte dédiée dans `lint.yml`) :
+  `[--level fail|warn|ok|info] [--edit ID] [--print-id] "Titre" ["Détail"]`, ou
+  `--unit NAME`. Codes : 0 envoyé, 1 échec, 2 usage, 3 aucun webhook.
+- **Un seul webhook pour tous les serveurs** : sur Discord, embed avec le
+  hostname en auteur, rôle + IP en champs, version en pied, couleur par niveau.
+  Le JSON est construit par `python3` (échappement sûr d'un journal d'unit) —
+  **ne pas revenir à un échappement bash à la main**.
+- **Règle anti-bruit, unique** : `fail`/`warn` notifient ; `ok`/`info` partent
+  avec `flags: 4096` (SUPPRESS_NOTIFICATIONS, visible sans ping) ; `--edit`
+  modifie un message (PATCH `…/messages/ID`, jamais de notification — et jamais
+  de `flags`, que Discord refuse en modification). `?thread_id=` est conservé.
+- Audit (`check_notify_failures`, appelé **même à 0 échec**) : échecs nouveaux →
+  message `fail` dont l'ID est gardé dans `check-notify.state` ; liste identique
+  (chiffres retirés) → rien avant 7 jours ; retour au vert → **modification** du
+  message d'alerte.
+- L'URL est un secret : `/etc/init-vps/notify.env` (600, `printf %q`), saisie
+  masquée (`prompt_secret`, `vps-helper notify-set`), **jamais** dans
+  `config.env` ni le log. `config.env` ne garde que `NOTIFY_ENABLED`.
+- `ExecStart=-…` (tiret) dans les units déclenchées : un envoi raté ne doit pas
+  créer une unit en échec de plus, que `check` signalerait à son tour.
+- `vps-notify` et les units sont **toujours** installés (inertes sans webhook) ;
+  seul `vps-check.timer` dépend de `NOTIFY_ENABLED`.
+
+### Redémarrage automatique (étape 22) — un message par redémarrage
+
+`Automatic-Reboot "false"` reste dans unattended-upgrades : son redémarrage
+intégré part sans préavis ni compte rendu. Le cycle vit dans `vps-helper
+reboot-auto <notice|run|report>`, les units ne font que le déclencher :
+
+1. `vps-reboot-notice.path` (`PathExists=/run/reboot-required`) → `notice` :
+   planifié à la 1re fenêtre ≥ `REBOOT_MIN_NOTICE` (12 h), écrit dans
+   `/var/lib/init-vps/reboot-planned` (« époque id_message ») **avant** l'envoi —
+   planifié même sans webhook. Service en `RemainAfterExit=yes`, sinon
+   PathExists le relance en boucle.
+2. `vps-reboot-auto.timer` (fenêtre, `RandomizedDelaySec=30min`,
+   **`Persistent=false`** : jamais de rattrapage en journée) → `run` : jamais sans
+   préavis (non planifié → planifie et sort), attend dpkg jusqu'à 30 min puis
+   reporte, mémorise les services, **modifie** le message, reboot.
+3. `vps-reboot-report.timer` (`OnBootSec=5min`) → `report` : compare les services
+   (Swarm par **nom de service**, les conteneurs de tâche changent de nom) jusqu'à
+   10 min ; tout revenu → modification `ok` ; sinon modification `warn` +
+   **nouveau** message `fail` (le seul du cycle qui notifie).
+
+`step_auto_reboot` s'exécute **après** `step_save_state` : `reboot-auto` lit
+`AUTO_REBOOT`/`AUTO_REBOOT_TIME` dans `config.env`. Il appelle aussi `notice`
+directement, pour un redémarrage déjà requis au moment de l'installation.
+Dates de report calculées « date + 1 day » (et non +86400) : juste au passage
+à l'heure d'hiver. `check` garde le FAIL au-delà de 7 jours (reports répétés).
+
+`check_system` couvre ce que rien ne signalait : units en échec, disques ≥ 80 %
+(WARN) / ≥ 90 % (FAIL), reboot en attente > 7 jours (FAIL), erreurs de la
+**dernière** exécution d'unattended-upgrades.
+
+### `DOCKER-USER` IPv6
+
+`apply.sh` pose un miroir `ip6tables` (80, 443/tcp, 443/udp, `fc00::/7`, DROP
+sur l'interface de la route v6 par défaut), en sautant si ip6tables/IPv6/route
+sont absents ou si la chaîne v6 contient des règles tierces. Tant que l'IPv6 est
+désactivé dans Docker, ce trafic passe par docker-proxy (INPUT, donc UFW) et le
+miroir est sans effet ; il protège le jour où `"ipv6": true` est activé.
+`cmd_check` FAIL uniquement si l'IPv6 Docker est actif **et** la chaîne v6 vide.
 
 ### Rôle du serveur (`SERVER_ROLE`) — manager vs remote server
 
@@ -121,7 +279,9 @@ utile.
 
 ### Mode mise à jour (`--update` / `/etc/init-vps/config.env`)
 
-`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`.
+`step_save_state()` (dernière étape, avant `print_summary`) écrit la configuration collectée dans `/etc/init-vps/config.env` (`SERVER_HOSTNAME`, `ADMIN_USER`, `TIMEZONE`, `SWAP_SIZE_GB`, `DOKPLOY_RESTRICT_IP`, `ADVERTISE_ADDR`, `SERVER_ROLE`, `DOKPLOY_PORT_CLOSED`, `SSH_PORT`, `NOTIFY_ENABLED`, `AUTO_REBOOT`, `AUTO_REBOOT_TIME`, `SCRIPT_VERSION`, `LAST_RUN`). Les clés SSH ne sont **jamais** persistées ici — `authorized_keys` sur le serveur reste la seule source de vérité, gérée via `vps-helper ssh-keys`. **Aucun secret non plus** (URL de webhook : `notify.env`, 600) — ce fichier est `source`-é, toute valeur saisie qui y finit doit passer un validateur au jeu de caractères restreint.
+
+**Nouvelles options et mode mise à jour** : `ask_new_options` pose, et seulement elles, les questions dont la clé est **absente** de `config.env` (`state_has`) — une option apparue après le provisionnement du serveur. Un refus est persisté (`"0"`) et n'est plus jamais reposé. Exception : une option acceptée dont le fichier de secret a disparu est reproposée. Toute future option suit ce schéma : variable vide par défaut, clé dans `step_save_state`, entrée dans `ask_new_options`.
 
 Au lancement suivant, `main()` détecte ce fichier et propose (ou force via `sudo ./init-vps.sh --update`) un **mode mise à jour** : la config est `source`-ée (aucune question reposée), puis **toutes** les étapes `step_*` sont rejouées normalement, dans le même ordre que l'installation initiale. Ce n'est volontairement pas un mécanisme séparé : comme chaque `step_*` est déjà idempotente (voir « Pattern step_* idempotent » ci-dessous), les rejouer suffit à propager tout changement apporté au script (nouveau contenu MOTD, nouvelle commande vps-helper, nouvelle règle sysctl, etc.) sans code de mise à jour dédié à maintenir en parallèle.
 

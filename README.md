@@ -66,7 +66,9 @@ curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-
 ```
 
 La configuration est relue depuis `/etc/init-vps/config.env` : **aucune question
-n'est reposée**, et toutes les étapes sont rejouées. Elles sont idempotentes, donc
+déjà répondue n'est reposée**, et toutes les étapes sont rejouées. Seules les options
+apparues depuis la version qui a provisionné le serveur (port SSH, notifications, redémarrage automatique) sont
+proposées, une seule fois — un refus est mémorisé. Elles sont idempotentes, donc
 celles déjà en place sont simplement ignorées — y compris le verrouillage SSH, qui
 ne redemande aucune confirmation. La mise à jour des paquets système est volontairement
 sautée dans ce mode.
@@ -93,8 +95,9 @@ le mode mise à jour ; le drapeau ne fait que répondre « oui » d'avance.
 | 6   | UFW (pare-feu, dont UDP/443 pour HTTP/3)            | 17  | Audit des ports publiés (lecture seule)           |
 | 7   | Durcissement SSH — phase 2 (verrouillage)           | 18  | Installation de Dokploy                           |
 | 8   | Verrouillage du compte root                         | 19  | Optimisation Traefik (HTTP/3 + compression)       |
-| 9   | unattended-upgrades (MAJ sécurité auto)             | 20  | Sauvegarde de la configuration (mode `--update`)  |
-| 10  | Durcissement sysctl (réseau + mémoire + perfs)      |     |                                                   |
+| 9   | unattended-upgrades (MAJ sécurité auto)             | 20  | Notifications webhook (optionnel)                 |
+| 10  | Durcissement sysctl (réseau + mémoire + perfs), **vérifié au runtime** | 21  | Sauvegarde de la configuration (mode `--update`)  |
+|     |                                                     | 22  | Redémarrage automatique nocturne si requis (optionnel) |
 
 `needrestart` est réglé en mode automatique **avant** l'étape 1, pour qu'aucun menu interactif n'interrompe le `dist-upgrade`.
 
@@ -133,7 +136,11 @@ Commande d'administration installée sur le serveur lors de l'initialisation.
 | `vps-helper restart <service>` | Redémarrer un service : `ssh`, `fail2ban`, `docker`           |
 | `vps-helper logs <conteneur>`  | Afficher les logs d'un conteneur Docker (Ctrl+C pour quitter) |
 | `vps-helper update`            | Mettre à jour le système (sécurité incluse)                   |
-| `vps-helper check`             | Auditer le durcissement en lecture seule (PASS / FAIL / INFO) |
+| `vps-helper check [--notify]`  | Auditer le serveur en lecture seule (PASS / FAIL / WARN / INFO) ; `--notify` envoie les FAIL au webhook |
+| `vps-helper notify-set`        | Poser ou changer l'URL du webhook, puis envoi de test         |
+| `vps-helper notify-test [fail]`| Notification de test (`fail` : alerte qui notifie)            |
+| `vps-helper reboot-status`     | Redémarrage requis / planifié                                 |
+| `vps-helper reboot-skip`       | Reporter de 24 h le redémarrage automatique planifié          |
 | `vps-helper traefik-tuning`    | Activer HTTP/3 + compression Traefik (idempotent)             |
 | `vps-helper docker-firewall <status\|apply\|clear>` | État / (re)pose / retrait du filtrage `DOCKER-USER` |
 | `vps-helper version`           | Afficher la version de `init-vps.sh` utilisée                 |
@@ -145,13 +152,50 @@ Audit de lecture seule. Vérifie :
 
 - **SSH** — `PermitRootLogin no` et `PasswordAuthentication no` (config effective via `sshd -T`)
 - **UFW** — actif, politique par défaut `deny incoming`
-- **fail2ban** — service actif, jails `sshd` et `recidive`
+- **fail2ban** — service actif, jail `sshd`, jail `recidive` **réellement alimentée** (elle lit bien `fail2ban.log`), bans effectivement présents dans le pare-feu (`nftables` **et** `iptables`)
 - **Compte root** — verrouillé
 - **Docker** — rotation des logs (`max-size` dans `daemon.json`)
-- **Ports publiés par Docker** — tout port exposé sur toutes les interfaces hors 80/443 (conteneurs **et** services Swarm), et état de la chaîne `DOCKER-USER`
+- **Ports publiés par Docker** — tout port exposé sur toutes les interfaces hors 80/443 (conteneurs **et** services Swarm), état de la chaîne `DOCKER-USER` (IPv4 et IPv6)
+- **Mémoire des conteneurs** — OOM kills depuis le boot (résolus en noms de conteneurs), throttling mémoire via `memory.events` (invisible dans les logs), pic mémoire > 90 % de la limite ; « non concluant » pour un conteneur démarré depuis moins de 24 h, dont les compteurs viennent d'être remis à zéro
 - **Traefik** — HTTP/3 activé, middleware `compression` attaché à `websecure`
-- **unattended-upgrades** — service actif
-- **Informationnel** — swap, port 3000, redémarrage requis, état Docker Swarm
+- **unattended-upgrades** — service actif, dernière exécution sans erreur
+- **sysctl** — chaque réglage posé par init-vps comparé à sa valeur runtime, avec le fichier qui l'écrase le cas échéant
+- **Redémarrage des conteneurs** — conteneurs hors Swarm sans politique de redémarrage, qui ne reviendraient pas après un reboot
+- **Système** — units systemd en échec, disques ≥ 80 % (WARN) / ≥ 90 % (FAIL), redémarrage en attente depuis plus de 7 jours
+- **Informationnel** — port SSH, swap, port 3000, état Docker Swarm
+
+### Notifications
+
+Optionnelles (question posée à l'installation, ou au prochain `--update`). **Un même webhook Discord peut servir tous les serveurs** : chaque message est un embed qui porte le nom du serveur, son rôle (manager / remote), son IP et la version d'init-vps, avec une couleur par niveau.
+
+Pensé pour rester lisible à 5 serveurs ou plus — **une seule règle** :
+
+| Événement | Message |
+| --- | --- |
+| 🔴 Échecs nouveaux ou différents à l'audit quotidien (`vps-check.timer`) | Nouveau message, **notifie** |
+| Même liste d'échecs que la veille | Rien (rappel au plus tous les 7 jours) |
+| ✅ Retour au vert | Le message d'alerte est **modifié** (aucune notification) |
+| 🔴 Échec d'unattended-upgrades | Nouveau message, **notifie** |
+| 🔵 Redémarrage planifié / en cours / ✅ terminé | **Un seul** message, silencieux, modifié à chaque étape |
+| 🔴 Services non revenus après un redémarrage | Nouveau message, **notifie** |
+
+Silencieux = visible dans le salon, sans notification (flag Discord `SUPPRESS_NOTIFICATIONS`).
+
+L'URL du webhook est un secret : elle vit dans `/etc/init-vps/notify.env` (600), jamais dans `config.env` ni dans le log. La changer : `sudo vps-helper notify-set`.
+
+### Redémarrage automatique
+
+Optionnel. `unattended-upgrades` installe les correctifs de sécurité chaque jour, mais un nouveau kernel ne s'applique qu'au redémarrage — et un simple rappel dépend de quelqu'un qui le lit.
+
+1. Un redémarrage devient requis → il est **annoncé** et planifié dans la fenêtre nocturne (04:00 par défaut, ± 30 min) située **au moins 12 h plus tard**.
+2. `vps-helper reboot-skip` le reporte de 24 h. Une installation de paquets en cours le reporte aussi.
+3. Au retour, les services (Swarm et conteneurs) sont comparés à la liste d'avant : tout est revenu → message modifié ; sinon → alerte.
+
+Plusieurs serveurs : décaler les fenêtres (ex. manager 04:00, remotes 04:30) évite de tout couper en même temps. Une fenêtre manquée (serveur éteint) n'est jamais rattrapée en journée.
+
+### Port SSH
+
+22 par défaut, ajustable. Ce n'est pas une mesure de sécurité, mais cela réduit fortement le bruit des robots et la charge de fail2ban. Le changement se fait **sans risque de verrouillage** : sshd écoute sur l'ancien et le nouveau port, test dans un autre terminal, puis fermeture de l'ancien — un refus revient à l'ancien port. Penser à autoriser le nouveau port dans un éventuel pare-feu **externe** (Hetzner Cloud Firewall…), invisible depuis le serveur.
 
 ---
 
