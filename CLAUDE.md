@@ -172,28 +172,52 @@ Un compteur non nul est concluant quel que soit l'âge ; un `max 0` sur un
 conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
 « non concluant », **jamais PASS**. Un faux négatif ici est pire que pas de check.
 
-**`max > 0` ne suffit pas.** Mesuré sur un cron WordPress limité à 512M :
-`max 13945` en 15 h, `oom_kill 0`, `memory.peak` = limite ; `memory.stat` :
-`anon` 152 Kio, `file` 217 Mio, `pgmajfault` 48. Le noyau libère du cache de
-pages froid : c'est bénin. `workingset_refault_file` (374 007) ne tranche pas :
-`wp` relit ses fichiers PHP à chaque cycle. Le critère retenu est le **coût moyen
-d'un reclaim** : `full total` de `memory.pressure` (µs, PSI) ÷ `max` — ici
-`total=1208074`, soit 1,2 s bloqué en 15 h, ~87 µs par reclaim.
+**`max > 0` ne suffit pas.** Le critère est l'**efficacité du reclaim**, lue dans
+`memory.stat` : `pgsteal ÷ max`, soit les pages réellement libérées par dépassement
+(`MEM_RECLAIM_MIN_PAGES=16`).
+
+- **Sain** — cron WordPress à 512M : `max 13945`, `oom_kill 0`, `file` 57 Mio,
+  `pgscan 944650` / `pgsteal 944613` (~68 pages par dépassement), `pgmajfault 48`.
+  Le noyau libère du cache de pages froid : c'est bénin.
+- **Malade** — même type de cron forcé à 128M via `docker update`, puis
+  `wp cron event run wp_version_check` tué (exit 137) : `max 48`, `oom_kill 1`,
+  `file 0`, `pgscan 0` / `pgsteal 0`. Plus rien à libérer, l'OOM suit.
 
 | Cas | Verdict |
 |---|---|
 | `oom_kill > 0` | FAIL |
-| `max > 0`, PSI illisible | FAIL |
-| `max > 0`, coût ≥ 1 ms | FAIL « thrashing » |
-| `max > 0`, coût < 1 ms | INFO, puis logique d'âge habituelle |
+| `max > 0`, `memory.stat` illisible | FAIL |
+| `max > 0`, `pgsteal / max < 16` | FAIL « sans mémoire récupérable » |
+| `max > 0`, `pgmajfault > 100` et `> max / 10` | FAIL « thrashing » |
+| sinon | INFO, puis logique d'âge habituelle |
 
-⚠️ `MEM_RECLAIM_COST_FAIL_US=1000` est **provisoire** : jamais mesuré sur un cas
-malade, calibration en cours. Méthode : `docker update --memory 128m` sur un cron
-de test pendant 2 h, relever `max` et `full total`, remettre 512M, puis
-`docker restart` pour remettre les compteurs à zéro.
+`pgsteal` et `pgmajfault` sont lus en correspondance exacte (`$1 == "pgsteal"`) :
+un motif lâche prendrait `pgsteal_direct`.
+
+**Critères rejetés** — ne pas les réintroduire :
+
+- **PSI** (`full total` de `memory.pressure` ÷ `max`) : 86 µs par reclaim pour le
+  cas sain, contre 19 µs (893 ÷ 48) et 108 µs (36 692 ÷ 340, `oom_kill 2`) pour
+  les cas malades. Un conteneur saturé mais pas encore tué passait en INFO.
+- **`workingset_refault_file`** : 374 007 sur le cas sain (`wp` relit ses fichiers
+  PHP à chaque cycle).
+
+⚠️ Le garde-fou `pgmajfault` (`MEM_MAJFAULT_FLOOR=100`) est **provisoire** : il
+vise l'incident historique (code PHP mappé évincé sans OOM — `pgsteal` non nul,
+`pgmajfault` élevé), jamais mesuré avec ces compteurs. Méthode de test
+reproductible (~1 min) :
+
+1. `docker update --memory 128m --memory-swap 128m <cron>`, puis `docker restart <cron>` ;
+2. `docker exec <cron> wp cron event run wp_version_check wp_update_plugins wp_update_themes` ;
+3. relever `memory.events` et `memory.stat` **avant** de remettre 512M ;
+4. remettre 512M, puis `docker restart <cron>`.
+
+`docker update` ne remet **pas** les compteurs à zéro, `docker restart` si.
+L'attente passive ne suffit pas : 2 h à 128M ont donné `max 0`, les tâches lourdes
+ne tournent que toutes les 12 h.
 
 `memory.peak` ≥ 90 % de `memory.max` → WARN (alerte précoce), sauf si la limite
-est déjà atteinte sans coût. Un conteneur sans
+est déjà atteinte avec un reclaim de cache efficace. Un conteneur sans
 limite (`max`) n'est pas « throttlable » : il est seulement compté.
 
 Les fonctions `check_*` incrémentent `pass`/`fail` de `cmd_check` par portée

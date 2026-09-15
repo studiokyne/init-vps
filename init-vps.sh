@@ -2098,14 +2098,24 @@ cmd_docker_firewall() {
 # un cycle complet (tâches nocturnes, pic de trafic de la journée).
 MEM_EVENTS_MIN_AGE=86400
 
-# Coût moyen d'un reclaim (µs de blocage PSI « full » ÷ compteur `max`) à partir
-# duquel une limite atteinte devient un vrai problème. `max > 0` seul ne suffit
-# pas — mesuré sur un cron WordPress à 512M : max 13 945 en 15 h, oom_kill 0,
-# peak = limite, mais anon 152 Kio / file 217 Mio : le noyau libère du cache de
-# pages froid. full total=1208074, soit 1,2 s bloqué en 15 h, ~87 µs par reclaim.
-# (workingset_refault_file à 374 007 ne tranche pas : wp relit ses PHP à chaque
-# cycle.) Seuil PROVISOIRE : jamais mesuré sur un cas malade (voir CLAUDE.md).
-MEM_RECLAIM_COST_FAIL_US=1000
+# Limite atteinte (`max > 0`) : bénigne ou non ? Critère = efficacité du reclaim,
+# lue dans memory.stat : pgsteal ÷ max = pages réellement libérées par dépassement.
+#   - Sain   : cron WordPress à 512M — max 13 945, oom_kill 0, file 57 Mio,
+#              pgscan 944 650 / pgsteal 944 613 (~68 pages par dépassement),
+#              pgmajfault 48. Le noyau libère du cache de pages froid.
+#   - Malade : même cron forcé à 128M, `wp cron event run` tué (exit 137) —
+#              max 48, oom_kill 1, file 0, pgscan 0 / pgsteal 0 : plus rien à
+#              libérer, l'OOM suit.
+# Rejetés : le coût PSI (full total ÷ max) ne distingue rien — 86 µs par reclaim
+# pour le sain, 19 µs (893 ÷ 48) et 108 µs (36 692 ÷ 340, oom_kill 2) pour les
+# malades. workingset_refault_file vaut 374 007 sur le cas sain (wp relit ses
+# PHP à chaque cycle).
+MEM_RECLAIM_MIN_PAGES=16
+# Garde-fou thrashing : code mappé évincé puis relu depuis le disque sans OOM —
+# pgsteal non nul mais pgmajfault élevé. FAIL si pgmajfault > ce plancher ET
+# pgmajfault × 10 > max. Seuil PROVISOIRE : ce cas n'a jamais été mesuré avec
+# ces compteurs (méthode de test dans CLAUDE.md).
+MEM_MAJFAULT_FLOOR=100
 
 human_bytes() { numfmt --to=iec --suffix=o "$1" 2>/dev/null || echo "${1} o"; }
 
@@ -2147,8 +2157,9 @@ container_cgroup_dir() {
 #     lieu de tuer, le service survit mais thrashe. Seul le compteur `max` de
 #     memory.events le trahit. Mesuré en production : 35 652 fois en quelques
 #     semaines, conteneur « Up (healthy »), aucun log applicatif.
-#   - coût du throttling → memory.pressure (PSI) : `max` compte aussi les
-#     reclaims de cache de pages bénins, seul le temps bloqué les distingue.
+#   - efficacité du reclaim → memory.stat (pgsteal, pgmajfault) : `max` compte
+#     aussi les reclaims de cache de pages bénins. Le PSI ne les distingue pas
+#     (86 µs par reclaim sain, 19 à 108 µs sur des cas malades mesurés).
 check_container_memory() {
     chk_sect "Mémoire des conteneurs"
     if ! command -v docker >/dev/null 2>&1; then
@@ -2192,7 +2203,7 @@ check_container_memory() {
         return
     fi
     local now full pid started dir max_ev oom_ev limit peak age start_s ratio
-    local stall_us cost_us benign
+    local steal majf benign
     local -a cheap=()
     local ok_n=0 unlimited_n=0 unreadable_n=0
     now=$(date +%s)
@@ -2214,23 +2225,28 @@ check_container_memory() {
             continue
         fi
         # Limite atteinte : bénin si le noyau n'a libéré que du cache froid, grave
-        # s'il bloque les process. Seul le coût moyen d'un reclaim (PSI) tranche.
+        # s'il n'y a plus rien à libérer ou si le code est relu depuis le disque.
+        # pgsteal / pgmajfault en correspondance exacte (pas pgsteal_direct, etc.).
         benign=0
         if [ "${max_ev:-0}" -gt 0 ]; then
-            stall_us=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { sub(/^total=/, "", $i); print $i } }' \
-                "${dir}/memory.pressure" 2>/dev/null)
-            if ! [[ "$stall_us" =~ ^[0-9]+$ ]]; then
-                chk_fail "${name} : limite atteinte ${max_ev} fois en $(human_age "$age"), coût inconnu (PSI illisible) — limite $(human_bytes "$limit")"
+            steal=$(awk '$1 == "pgsteal" {print $2}' "${dir}/memory.stat" 2>/dev/null)
+            majf=$(awk '$1 == "pgmajfault" {print $2}' "${dir}/memory.stat" 2>/dev/null)
+            if ! [[ "$steal" =~ ^[0-9]+$ ]] || ! [[ "$majf" =~ ^[0-9]+$ ]]; then
+                chk_fail "${name} : limite atteinte ${max_ev} fois en $(human_age "$age"), efficacité du reclaim illisible — limite $(human_bytes "$limit")"
                 fail=$((fail+1))
                 continue
             fi
-            cost_us=$((stall_us / max_ev))
-            if [ "$cost_us" -ge "$MEM_RECLAIM_COST_FAIL_US" ]; then
-                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, $(awk -v u="$stall_us" 'BEGIN { printf "%.1f", u / 1000000 }') s bloqué ($(awk -v u="$cost_us" 'BEGIN { printf "%.1f", u / 1000 }') ms par reclaim) en $(human_age "$age") — limite $(human_bytes "$limit")"
+            if [ "$steal" -lt $((max_ev * MEM_RECLAIM_MIN_PAGES)) ]; then
+                chk_fail "${name} : limite atteinte ${max_ev} fois sans mémoire récupérable ($((steal / max_ev)) pages libérées par dépassement) en $(human_age "$age") — limite $(human_bytes "$limit"), risque d'OOM"
                 fail=$((fail+1))
                 continue
             fi
-            cheap+=("${name} (${max_ev} reclaims, ${cost_us} µs chacun)")
+            if [ "$majf" -gt "$MEM_MAJFAULT_FLOOR" ] && [ $((majf * 10)) -gt "$max_ev" ]; then
+                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, ${majf} relectures disque de code en $(human_age "$age") — limite $(human_bytes "$limit")"
+                fail=$((fail+1))
+                continue
+            fi
+            cheap+=("${name} (${max_ev} dépassements, $((steal / max_ev)) pages de cache libérées chacun)")
             benign=1
         fi
         if [ -z "$limit" ] || [ "$limit" = "max" ]; then
@@ -2238,7 +2254,8 @@ check_container_memory() {
             continue
         fi
         # Alerte précoce : le pic approche la limite avant que `max` ne bouge.
-        # Sans objet si la limite est déjà atteinte sans coût (peak = limite).
+        # Sans objet si la limite est déjà atteinte avec un reclaim de cache
+        # efficace (peak = limite).
         if [ "$benign" -eq 0 ] && [ -n "$peak" ] && [ "$limit" -gt 0 ]; then
             ratio=$((peak * 100 / limit))
             if [ "$ratio" -ge 90 ]; then
@@ -2258,7 +2275,7 @@ check_container_memory() {
         chk_pass "${ok_n} conteneur(s) limité(s) sans throttling ni OOM depuis au moins $(human_age "$MEM_EVENTS_MIN_AGE")"; pass=$((pass+1))
     fi
     if [ "${#cheap[@]}" -gt 0 ]; then
-        chk_info "Limite atteinte sans blocage notable (cache de pages libéré, sans effet sur les process) :"
+        chk_info "Limite atteinte, cache de pages libéré sans effet sur les process :"
         printf '      %s\n' "${cheap[@]}"
     fi
     if [ "${#young[@]}" -gt 0 ]; then
