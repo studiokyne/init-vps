@@ -305,6 +305,29 @@ Dates de report calculées « date + 1 day » (et non +86400) : juste au passage
 (WARN) / ≥ 90 % (FAIL), reboot en attente > 7 jours (FAIL), erreurs de la
 **dernière** exécution d'unattended-upgrades.
 
+#### Exception : `cloud-init-hotplugd.service` sur Hetzner
+
+Sur Hetzner (Ubuntu 24.04, cloud-init 26.1, `cloud-init devel hotplug-hook -s net
+query` = `enabled`), chaque création de conteneur ajoute une interface `veth`.
+Le hook hotplug la cherche dans les métadonnées Hetzner, ne l'y trouve pas, et
+échoue :
+
+    RuntimeError: Failed to detect False in updated metadata
+
+`cloud-init-hotplugd.service` passe alors en échec. Mesuré : 4 échecs en 24 h,
+~82 s chacun ; l'un démarre à la seconde près (16:03:39 UTC) avec le démarrage
+d'un conteneur, un autre pendant des `docker restart`.
+
+- **On ne masque pas `cloud-init-hotplugd.socket`** : l'attachement à chaud d'un
+  réseau privé Hetzner resterait sinon manuel. C'est l'audit qui tolère.
+- **Le filtre porte sur le message (`in updated metadata`), pas sur le nom de
+  l'unit** : un vrai échec du hotplug (autre cause) doit continuer à remonter en
+  FAIL. L'unit tolérée est retirée de `failed` et signalée en INFO ; si c'était la
+  seule, le résultat est PASS + INFO.
+- Les logs sont lus via `journalctl -u … -b -n 200`, qui exige root ou le groupe
+  `adm`. Lancé sans sudo, le journal est vide, l'exception ne s'applique pas et le
+  FAIL reste — acceptable, `vps-check.timer` tourne en root.
+
 ### `DOCKER-USER` IPv6
 
 `apply.sh` pose un miroir `ip6tables` (80, 443/tcp, 443/udp, `fc00::/7`, DROP
@@ -416,6 +439,25 @@ step_xxx() {
 
 - `prompt VARNAME "Question" "défaut" [validateur]` — saisie avec validation
 - `confirm "Question" "o|n"` — oui/non, retourne 0 si oui
+
+### Piège : SIGPIPE sous `pipefail` (`cmd | head`, `cmd | grep -q`)
+
+vps-helper tourne en `set -uo pipefail`. Sous `pipefail`, `cmd | head` et
+`cmd | grep -q` dans une condition échouent par SIGPIPE (code 141) quand `cmd`
+produit beaucoup de sortie : le lecteur se ferme avant que `cmd` ait fini
+d'écrire. **Capturer d'abord dans une variable**, puis tester avec
+`grep -q … <<< "$var"` ou `[ -z "$var" ]`.
+
+Incident (release 2026.09.15.2) : `kernel_log | head -n 1 | grep -q .` — le
+journal noyau peut atteindre 200 Mo — faisait afficher « Journal noyau
+illisible : OOM kills non vérifiables » sur un journal parfaitement lisible ; la
+détection des OOM était aveugle. Même traitement pour `sshd -T` dans
+`cmd_check`. Reproduction :
+
+    bash -c 'set -o pipefail; big(){ seq 1 200000; }; if ! big | head -n 1 | grep -q .; then echo ILLISIBLE; else echo OK; fi'   # → ILLISIBLE
+
+Les sorties courtes (`ufw status`, `docker ps --format`, `journalctl -n 1`,
+`fail2ban-client status`…) ne sont pas concernées.
 
 ---
 

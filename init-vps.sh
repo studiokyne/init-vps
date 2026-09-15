@@ -2168,11 +2168,14 @@ check_container_memory() {
     fi
 
     # 1) OOM kills — ID résolu en nom : un hash de 64 caractères ne se diagnostique pas.
-    local oom_lines cg_n global_n names="" count id name
-    if ! kernel_log | head -n 1 | grep -q .; then
-        chk_info "Journal noyau illisible : OOM kills non vérifiables"
+    # Journal lu UNE fois : le tester via un pipe vers head/grep -q échouait par SIGPIPE
+    # (141) sous pipefail dès que le journal était volumineux → faux « illisible ».
+    local klog oom_lines cg_n global_n names="" count id name
+    klog="$(kernel_log)"
+    if [ -z "$klog" ]; then
+        chk_warn "Journal noyau illisible : OOM kills non vérifiables"
     else
-        oom_lines="$(kernel_log | grep -E 'Out of memory|oom-kill:' || true)"
+        oom_lines="$(grep -E 'Out of memory|oom-kill:' <<< "$klog" || true)"
         cg_n=$(grep -c 'Memory cgroup out of memory' <<< "$oom_lines" || true)
         global_n=$(grep 'Out of memory: Kill' <<< "$oom_lines" | grep -vc 'Memory cgroup' || true)
         while read -r count id; do
@@ -2407,10 +2410,24 @@ check_sysctl() {
 # depuis des semaines, unattended-upgrades en erreur.
 check_system() {
     chk_sect "Système"
-    local failed use mnt disk_issue=0 now age
+    local failed use mnt disk_issue=0 now age hp_log
+    local -a failed_units=()
     now=$(date +%s)
 
     failed="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | paste -sd' ')"
+    # Hetzner : chaque veth Docker déclenche le hotplug cloud-init, qui échoue
+    # (« Failed to detect False in updated metadata »). Toléré sur CE message
+    # seulement : tout autre échec du hotplug reste un FAIL (voir CLAUDE.md).
+    if [[ " $failed " == *" cloud-init-hotplugd.service "* ]]; then
+        hp_log="$(journalctl -u cloud-init-hotplugd.service -b -n 200 --no-pager 2>/dev/null)"
+        if grep -q 'in updated metadata' <<< "$hp_log"; then
+            failed=" $failed "
+            failed="${failed// cloud-init-hotplugd.service / }"
+            read -r -a failed_units <<< "$failed"
+            failed="${failed_units[*]}"
+            chk_info "cloud-init-hotplugd en échec : interface Docker (veth) inconnue des métadonnées Hetzner — bénin, voir CLAUDE.md"
+        fi
+    fi
     if [ -z "$failed" ]; then
         chk_pass "Aucune unit systemd en échec"; pass=$((pass+1))
     else
@@ -2774,12 +2791,15 @@ cmd_check() {
     printf '\n%b\n' "${C_BOLD}Audit du durcissement du serveur${C_RESET}"
 
     chk_sect "SSH"
-    if sshd -T 2>/dev/null | grep -q '^permitrootlogin no'; then
+    # Capturé une fois : `sshd -T | grep -q` peut échouer par SIGPIPE sous pipefail.
+    local sshd_cfg
+    sshd_cfg="$(sshd -T 2>/dev/null)"
+    if grep -q '^permitrootlogin no' <<< "$sshd_cfg"; then
         chk_pass "PermitRootLogin no"; pass=$((pass+1))
     else
         chk_fail "PermitRootLogin non désactivé (attendu : no)"; fail=$((fail+1))
     fi
-    if sshd -T 2>/dev/null | grep -q '^passwordauthentication no'; then
+    if grep -q '^passwordauthentication no' <<< "$sshd_cfg"; then
         chk_pass "PasswordAuthentication no"; pass=$((pass+1))
     else
         chk_fail "PasswordAuthentication non désactivé (attendu : no)"; fail=$((fail+1))

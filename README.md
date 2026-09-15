@@ -161,7 +161,7 @@ Audit de lecture seule. Vérifie :
 - **unattended-upgrades** — service actif, dernière exécution sans erreur
 - **sysctl** — chaque réglage posé par init-vps comparé à sa valeur runtime, avec le fichier qui l'écrase le cas échéant
 - **Redémarrage des conteneurs** — conteneurs hors Swarm sans politique de redémarrage, qui ne reviendraient pas après un reboot
-- **Système** — units systemd en échec, disques ≥ 80 % (WARN) / ≥ 90 % (FAIL), redémarrage en attente depuis plus de 7 jours
+- **Système** — units systemd en échec (échec connu de `cloud-init-hotplugd` causé par les interfaces Docker toléré (INFO)), disques ≥ 80 % (WARN) / ≥ 90 % (FAIL), redémarrage en attente depuis plus de 7 jours
 - **Informationnel** — port SSH, swap, port 3000, état Docker Swarm
 
 ### Notifications
