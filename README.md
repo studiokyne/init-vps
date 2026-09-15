@@ -61,9 +61,27 @@ Pour propager une nouvelle version du script (nouveau MOTD, nouvelle commande
 `vps-helper`, nouvelle règle sysctl…) sur un serveur déjà configuré :
 
 ```bash
+sudo vps-helper self-update
+```
+
+La dernière release est téléchargée, vérifiée (somme SHA-256, syntaxe, version),
+puis appliquée par `init-vps.sh --update` après confirmation, et suivie d'un
+`vps-helper check`. `--rollback` réapplique la version précédente. Le message de
+connexion, `vps-helper version` et l'audit signalent quand une nouvelle version
+est disponible.
+
+Alternative — premier passage à cette version, ou `vps-helper` trop ancien pour
+connaître `self-update` :
+
+```bash
 curl -fsSL https://github.com/studiokyne/init-vps/releases/latest/download/init-vps.sh \
   -o init-vps.sh && chmod +x init-vps.sh && sudo ./init-vps.sh --update
 ```
+
+> [!NOTE]
+> **Dépôt déplacé ?** Un dépôt *transféré* reste joignable (GitHub redirige).
+> S'il a été *recréé* ailleurs, lancer une fois sur chaque serveur :
+> `sudo vps-helper self-update --repo nouvel-owner/init-vps` (`--repo reset` pour revenir au dépôt d'origine).
 
 La configuration est relue depuis `/etc/init-vps/config.env` : **aucune question
 déjà répondue n'est reposée**, et toutes les étapes sont rejouées. Seules les options
@@ -143,7 +161,8 @@ Commande d'administration installée sur le serveur lors de l'initialisation.
 | `vps-helper reboot-skip`       | Reporter de 24 h le redémarrage automatique planifié          |
 | `vps-helper traefik-tuning`    | Activer HTTP/3 + compression Traefik (idempotent)             |
 | `vps-helper docker-firewall <status\|apply\|clear>` | État / (re)pose / retrait du filtrage `DOCKER-USER` |
-| `vps-helper version`           | Afficher la version de `init-vps.sh` utilisée                 |
+| `vps-helper version [--short]` | Version de `init-vps.sh` utilisée, et nouvelle version disponible (`--short` : le numéro seul) |
+| `vps-helper self-update [--yes] [--force] [--rollback] [--repo owner/name\|reset]` | Installer la dernière release (vérifiée), revenir à la précédente, ou changer de dépôt de releases |
 | `vps-helper help`              | Afficher l'aide                                               |
 
 ### `vps-helper check`
@@ -166,7 +185,7 @@ Audit de lecture seule. Vérifie :
 
 ### Notifications
 
-Optionnelles (question posée à l'installation, ou au prochain `--update`). **Un même webhook Discord peut servir tous les serveurs** : chaque message est un embed qui porte le nom du serveur, son rôle (manager / remote), son IP et la version d'init-vps, avec une couleur par niveau.
+Optionnelles (question posée à l'installation, ou au prochain `--update`). **Un même webhook Discord peut servir tous les serveurs** : chaque message est un embed qui porte le nom du serveur, son rôle (manager / remote), son IP et la version d'init-vps (avec la nouvelle version disponible, le cas échéant), avec une couleur par niveau. Les échecs d'audit sont regroupés par section, un échec par bloc : le sujet en gras, le détail à la ligne.
 
 Pensé pour rester lisible à 5 serveurs ou plus — **une seule règle** :
 
@@ -253,10 +272,12 @@ Exemples : `2026.06.21.1`, `2026.06.21.2`, `2026.07.01.1`
 
 1. Lance ShellCheck + vérification syntaxique du script et des heredocs
 2. Calcule la prochaine version du jour
-3. Injecte la version dans `SCRIPT_VERSION` (sur une copie — `main` conserve `0.0.0-dev`)
-4. Publie une GitHub Release avec le script versionné en asset
+3. Injecte la version dans `SCRIPT_VERSION` et le dépôt qui publie dans `INIT_VPS_REPO` (sur une copie — `main` conserve `0.0.0-dev`)
+4. Publie une GitHub Release avec le script versionné et sa somme `init-vps.sh.sha256` en assets
 
-La version installée sur un serveur est accessible via `vps-helper version`.
+La version installée sur un serveur est accessible via `vps-helper version`, qui indique aussi si une version plus récente est disponible (`sudo vps-helper self-update` pour l'installer).
+
+> La somme SHA-256 détecte un téléchargement corrompu ou tronqué, **pas** un compte GitHub compromis : elle est publiée dans la même release que le script.
 
 ---
 

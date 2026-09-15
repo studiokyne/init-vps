@@ -73,6 +73,10 @@ set -euo pipefail
 # CONSTANTES
 ###############################################################################
 SCRIPT_VERSION="0.0.0-dev"
+# Dépôt des releases (self-update, nouvelles versions). Remplacé à la
+# publication par le dépôt qui publie (auto-release.yml) : ne l'écrire en dur
+# nulle part ailleurs dans la logique.
+INIT_VPS_REPO="studiokyne/init-vps"
 LOG_FILE="/var/log/init-vps.log"
 SSHD_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 STATE_DIR="/etc/init-vps"
@@ -1406,7 +1410,11 @@ step_motd() {
 
     mkdir -p /etc/update-motd.d
     backup_file /etc/update-motd.d/00-studiokyne
-    cat > /etc/update-motd.d/00-studiokyne <<'MOTDEOF'
+    # Écrit à côté puis renommé (voir CLAUDE.md, « Écriture des fichiers
+    # générés ») ; run-parts ignore les noms commençant par un point.
+    local motd_tmp
+    motd_tmp="$(mktemp /etc/update-motd.d/.00-studiokyne.XXXXXX)"
+    cat > "$motd_tmp" <<'MOTDEOF'
 #!/usr/bin/env bash
 # MOTD — généré par init-vps.sh, design uniforme à chaque connexion.
 
@@ -1449,6 +1457,19 @@ else
     REBOOT_LINE="${C_GREEN}non requis${C_RESET}"
 fi
 
+# Version d'init-vps : cache de vps-helper uniquement, JAMAIS de réseau ici
+# (ralentirait chaque connexion SSH). Comparaison dupliquée dans vps-helper
+# (iv_update_available) et vps-notify : les garder synchronisées.
+IV_VERSION="$(/usr/local/bin/vps-helper version --short 2>/dev/null)"
+IV_UPDATE=""
+if [[ -n "$IV_VERSION" && "$IV_VERSION" != "0.0.0-dev" && -r /var/lib/init-vps/latest-version ]]; then
+    read -r IV_LATEST _ < /var/lib/init-vps/latest-version
+    if [[ "${IV_LATEST:-}" =~ ^[0-9]+(\.[0-9]+)*$ && "$IV_LATEST" != "$IV_VERSION" \
+          && "$(printf '%s\n%s\n' "$IV_LATEST" "$IV_VERSION" | sort -V | tail -n 1)" == "$IV_LATEST" ]]; then
+        IV_UPDATE="$IV_LATEST"
+    fi
+fi
+
 printf '\n'
 printf "${C_CYAN}  ┌──────────────────────────────────────────────────┐${C_RESET}\n"
 printf "${C_CYAN}  │${C_RESET} ${C_BOLD}%-51s${C_RESET}${C_CYAN}│${C_RESET}\n" "${HOSTNAME_VAL}"
@@ -1461,10 +1482,17 @@ printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Disque /"  "${DISK_VAL}"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "IP locale" "${IP_LOCAL}"
 printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Docker"    "${DOCKER_LINE}"
 printf "  ${C_DIM}%-10s${C_RESET} %b\n" "Reboot"    "${REBOOT_LINE}"
+if [[ -n "$IV_VERSION" ]]; then
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "init-vps" "${IV_VERSION}"
+fi
+if [[ -n "$IV_UPDATE" ]]; then
+    printf "  ${C_DIM}%-10s${C_RESET} %b\n" "" "${C_YELLOW}Mise à jour disponible : ${IV_UPDATE} (sudo vps-helper self-update)${C_RESET}"
+fi
 printf "\n  ${C_DIM}Administration du serveur :${C_RESET} ${C_BOLD}vps-helper${C_RESET} (commandes disponibles : vps-helper help)\n"
 printf '\n'
 MOTDEOF
-    chmod +x /etc/update-motd.d/00-studiokyne
+    chmod 755 "$motd_tmp"
+    mv -f "$motd_tmp" /etc/update-motd.d/00-studiokyne
 
     # Sur Ubuntu 24.04, pam_motd.so est configuré avec noupdate par défaut :
     # les scripts update-motd.d ne sont exécutés qu'au boot, pas à chaque login.
@@ -1484,7 +1512,11 @@ MOTDEOF
 step_vps_helper() {
     log_step "Installation de la commande d'aide (vps-helper)"
     backup_file /usr/local/bin/vps-helper
-    cat > /usr/local/bin/vps-helper <<'HELPEREOF'
+    # Écrit à côté puis renommé : jamais vu à moitié écrit, et un vps-helper en
+    # cours d'exécution (self-update) garde l'ancienne version. Voir CLAUDE.md.
+    local helper_tmp
+    helper_tmp="$(mktemp /usr/local/bin/.vps-helper.XXXXXX)"
+    cat > "$helper_tmp" <<'HELPEREOF'
 #!/usr/bin/env bash
 # vps-helper — commandes d'administration pour ce serveur.
 # Généré par init-vps.sh. Documentation : vps-helper help
@@ -1494,6 +1526,7 @@ set -uo pipefail
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
 C_CYAN='\033[0;36m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_RED='\033[0;31m'
 INIT_VPS_VERSION="0.0.0-dev"
+INIT_VPS_REPO_DEFAULT=""
 DEFAULT_ADMIN_USER=""
 
 info() { echo -e "${C_DIM}[i]${C_RESET} $*"; }
@@ -1501,20 +1534,102 @@ ok()   { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
 warn() { echo -e "${C_YELLOW}[!]${C_RESET} $*"; }
 err()  { echo -e "${C_RED}[x]${C_RESET} $*" >&2; }
 
-# chk_fail mémorise aussi chaque message : `check --notify` les envoie tels quels.
+# chk_fail mémorise aussi chaque message, sous la forme « section<TAB>message » :
+# `check --notify` regroupe les échecs par section (check_fail_body).
 CHK_FAIL_MSGS=()
 CHK_WARN_N=0
+CHK_CUR_SECT=""
 chk_pass() { printf '%b %s\n' "${C_GREEN}[PASS]${C_RESET}" "$1"; }
-chk_fail() { printf '%b %s\n' "${C_RED}[FAIL]${C_RESET}" "$1"; CHK_FAIL_MSGS+=("$1"); }
+chk_fail() { printf '%b %s\n' "${C_RED}[FAIL]${C_RESET}" "$1"; CHK_FAIL_MSGS+=("${CHK_CUR_SECT}"$'\t'"$1"); }
 chk_warn() { printf '%b %s\n' "${C_YELLOW}[WARN]${C_RESET}" "$1"; CHK_WARN_N=$((CHK_WARN_N+1)); }
 chk_info() { printf '%b %s\n' "${C_CYAN}[INFO]${C_RESET}" "$1"; }
-chk_sect() { printf '\n%b%s%b\n' "${C_DIM}── " "$1" " ────────────────────────────────────────${C_RESET}"; }
+chk_sect() { CHK_CUR_SECT="$1"; printf '\n%b%s%b\n' "${C_DIM}── " "$1" " ────────────────────────────────────────${C_RESET}"; }
 
 IV_LIB=/var/lib/init-vps
 INIT_VPS_STATE=/etc/init-vps/config.env
 NOTIFY_ENV=/etc/init-vps/notify.env
 
-NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall notify-test notify-set reboot-auto reboot-skip reboot-status"
+# --- Versions et dépôt des releases -----------------------------------------
+# Surcharge manuelle du dépôt (migration) : une ligne owner/name, 644. Pas dans
+# config.env, que step_save_state réécrit à chaque exécution.
+IV_REPO_FILE=/etc/init-vps/repo
+# Cache « version epoch » (644) : lu par le MOTD et vps-notify, sans réseau.
+IV_LATEST_CACHE="${IV_LIB}/latest-version"
+IV_LATEST_FRESH=""
+IV_SCRIPT_DIR=/usr/local/lib/init-vps
+
+iv_repo_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+        && [[ "/$1/" != *"/./"* && "/$1/" != *"/../"* ]]
+}
+
+# Dépôt effectif : la surcharge si valide, sinon celui injecté à l'installation.
+iv_repo() {
+    local r=""
+    [ -r "$IV_REPO_FILE" ] && r="$(head -n 1 "$IV_REPO_FILE" | tr -d '[:space:]')"
+    if iv_repo_valid "$r"; then
+        printf '%s\n' "$r"
+    else
+        printf '%s\n' "$INIT_VPS_REPO_DEFAULT"
+    fi
+}
+
+# Vrai si $1 est strictement supérieure à $2 (sort -V : 2026.09.15.10 > 2026.09.15.9).
+iv_version_gt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
+# Dernière version connue : jamais de réseau.
+iv_latest() {
+    local v="${IV_LATEST_FRESH:-}" ts=""
+    if [ -z "$v" ] && [ -r "$IV_LATEST_CACHE" ]; then
+        read -r v ts < "$IV_LATEST_CACHE"
+    fi
+    [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    printf '%s\n' "$v"
+}
+
+# Rafraîchit le cache s'il a plus de $1 secondes (0 = toujours). Pas l'API
+# GitHub (quota) : la redirection de /releases/latest vers /releases/tag/vX,
+# suivie par -L, ce qui couvre aussi un dépôt transféré. Échec silencieux,
+# ancien cache conservé ; code 1 si aucune version n'a pu être obtenue.
+iv_latest_refresh() {
+    local max_age="${1:-3600}" now ts="" v="" url repo tmp
+    now=$(date +%s)
+    if [ "$max_age" -gt 0 ] && [ -r "$IV_LATEST_CACHE" ]; then
+        read -r v ts < "$IV_LATEST_CACHE"
+        if [[ "$ts" =~ ^[0-9]+$ ]] && [ $((now - ts)) -lt "$max_age" ] && iv_latest >/dev/null; then
+            return 0
+        fi
+    fi
+    repo="$(iv_repo)"
+    [ -n "$repo" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    url="$(curl -fsSL -o /dev/null --max-time 5 -w '%{url_effective}' \
+        "https://github.com/${repo}/releases/latest" 2>/dev/null)" || return 1
+    v="$(grep -oP '/releases/tag/v\K[0-9.]+$' <<< "$url")" || return 1
+    [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+    IV_LATEST_FRESH="$v"
+    # Sans root (`vps-helper version`), pas d'écriture : la valeur sert à cet appel.
+    [ "$EUID" -eq 0 ] || return 0
+    mkdir -p "$IV_LIB" 2>/dev/null || return 0
+    tmp="$(mktemp "${IV_LIB}/.latest-version.XXXXXX" 2>/dev/null)" || return 0
+    if printf '%s %s\n' "$v" "$now" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$IV_LATEST_CACHE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+# Comparaison dupliquée dans le MOTD et vps-notify : les garder synchronisées.
+iv_update_available() {
+    local latest
+    [ "$INIT_VPS_VERSION" = "0.0.0-dev" ] && return 1
+    latest="$(iv_latest)" || return 1
+    iv_version_gt "$latest" "$INIT_VPS_VERSION"
+}
+
+NEED_ROOT_CMDS="whitelist unban close-dokploy restart update check traefik-tuning ssh-keys docker-firewall notify-test notify-set reboot-auto reboot-skip reboot-status self-update"
 CMD="${1:-help}"
 
 # Élévation automatique des privilèges via sudo, si nécessaire.
@@ -1548,7 +1663,11 @@ ${C_BOLD}vps-helper${C_RESET} — commandes d'administration de ce serveur
   ${C_CYAN}vps-helper notify-test [fail]${C_RESET}  Notification de test (fail : alerte qui notifie)
   ${C_CYAN}vps-helper reboot-status${C_RESET}       Redémarrage requis / planifié
   ${C_CYAN}vps-helper reboot-skip${C_RESET}         Reporter de 24 h le redémarrage automatique planifié
-  ${C_CYAN}vps-helper version${C_RESET}             Afficher la version de init-vps.sh utilisée
+  ${C_CYAN}vps-helper version [--short]${C_RESET}   Version de init-vps.sh, et nouvelle version disponible
+  ${C_CYAN}vps-helper self-update${C_RESET}         Installer la dernière release (init-vps.sh --update, puis check)
+                                 --yes : sans confirmation · --force : même si à jour
+                                 --rollback : revenir à la version précédente
+                                 --repo owner/name|reset : changer de dépôt de releases
   ${C_CYAN}vps-helper help${C_RESET}                Afficher cette aide
 EOF
 )
@@ -1818,8 +1937,173 @@ cmd_update() {
     fi
 }
 
+# --short : le numéro seul, pour les scripts (vps-notify, MOTD).
 cmd_version() {
-    echo "${INIT_VPS_VERSION}"
+    if [ "${1:-}" = "--short" ]; then
+        printf '%s\n' "$INIT_VPS_VERSION"
+        return 0
+    fi
+    if [ "$INIT_VPS_VERSION" = "0.0.0-dev" ]; then
+        echo "${INIT_VPS_VERSION} (version de développement)"
+        return 0
+    fi
+    iv_latest_refresh 3600
+    if iv_update_available; then
+        printf '%b\n' "${INIT_VPS_VERSION} — ${C_YELLOW}nouvelle version disponible : $(iv_latest)${C_RESET} → sudo vps-helper self-update"
+    elif iv_latest >/dev/null; then
+        echo "${INIT_VPS_VERSION} (à jour)"
+    else
+        echo "${INIT_VPS_VERSION} (dernière version non vérifiable : github.com/$(iv_repo))"
+    fi
+}
+
+ask_yes_no() {
+    local answer=""
+    read -rp "$(printf '%b' "${C_YELLOW}?${C_RESET} $1 [o/N] : ")" answer || return 1
+    [[ "$answer" =~ ^[oOyY] ]]
+}
+
+# vps-helper ne doit jamais être réécrit pendant qu'il s'exécute : bash lit un
+# script au fur et à mesure. Ce processus est donc REMPLACÉ (exec) par un
+# lanceur temporaire, qui applique la mise à jour, lance l'audit, puis
+# supprime son répertoire (lui compris).
+self_update_launch() {
+    local script="$1" tmpd="$2" launcher="${2}/launch.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'script=%q\ntmpd=%q\n' "$script" "$tmpd"
+        cat <<'LAUNCHEOF'
+rc=0
+bash "$script" --update || rc=$?
+if [ "$rc" -eq 0 ]; then
+    /usr/local/bin/vps-helper check
+else
+    echo "init-vps.sh --update a échoué (code ${rc}) — journal : /var/log/init-vps.log" >&2
+fi
+rm -rf "$tmpd"
+exit "$rc"
+LAUNCHEOF
+    } > "$launcher"
+    # exec ne déclenche pas le trap EXIT : le répertoire est nettoyé par le lanceur.
+    trap - EXIT
+    exec bash "$launcher"
+}
+
+self_update_set_repo() {
+    local r="$1"
+    if [ "$r" = "reset" ]; then
+        rm -f "$IV_REPO_FILE"
+        ok "Surcharge du dépôt supprimée."
+    elif iv_repo_valid "$r"; then
+        mkdir -p "$(dirname "$IV_REPO_FILE")"
+        printf '%s\n' "$r" > "$IV_REPO_FILE"
+        chmod 644 "$IV_REPO_FILE"
+        ok "Dépôt enregistré dans ${IV_REPO_FILE}."
+    else
+        err "Dépôt invalide « ${r} » : format attendu owner/name (ou reset)."
+        exit 1
+    fi
+    # Le cache décrivait l'ancien dépôt.
+    rm -f "$IV_LATEST_CACHE"
+    info "Dépôt effectif : github.com/$(iv_repo)"
+}
+
+self_update_rollback() {
+    local yes="$1" prev="${IV_SCRIPT_DIR}/init-vps.prev.sh" prev_ver tmpd
+    if [ ! -f "$prev" ]; then
+        err "Aucune version précédente conservée (${prev}) : rien à restaurer."
+        exit 1
+    fi
+    prev_ver="$(grep -m1 -oP '^SCRIPT_VERSION="\K[^"]*' "$prev" 2>/dev/null)"
+    printf '%b\n' "${C_BOLD}Retour arrière : ${INIT_VPS_VERSION} → ${prev_ver:-?}${C_RESET}"
+    if [ "$yes" -eq 0 ] && ! ask_yes_no "Réappliquer cette version (init-vps.prev.sh --update) ?"; then
+        info "Annulé."
+        exit 0
+    fi
+    tmpd="$(mktemp -d /tmp/init-vps-rollback.XXXXXX)" || { err "mktemp impossible."; exit 1; }
+    self_update_launch "$prev" "$tmpd"
+}
+
+cmd_self_update() {
+    local yes=0 force=0 rollback=0 repo_set=0 repo_arg=""
+    local usage="Usage : vps-helper self-update [--yes] [--force] [--repo owner/name|reset] [--rollback]"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes|-y)   yes=1 ;;
+            --force)    force=1 ;;
+            --rollback) rollback=1 ;;
+            --repo)
+                if [ $# -lt 2 ]; then err "$usage"; exit 1; fi
+                repo_set=1; repo_arg="$2"; shift ;;
+            *) err "Option inconnue : « $1 »."; err "$usage"; exit 1 ;;
+        esac
+        shift
+    done
+
+    if [ "$repo_set" -eq 1 ]; then
+        self_update_set_repo "$repo_arg"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        err "self-update exige un terminal : init-vps.sh --update peut poser des questions."
+        exit 1
+    fi
+    if [ "$rollback" -eq 1 ]; then
+        self_update_rollback "$yes"
+        return 0
+    fi
+
+    local repo cur="$INIT_VPS_VERSION" latest tmpd base
+    repo="$(iv_repo)"
+    if ! iv_latest_refresh 0; then
+        err "Impossible de joindre https://github.com/${repo} — dépôt déplacé ? sudo vps-helper self-update --repo owner/name"
+        exit 1
+    fi
+    latest="$(iv_latest)"
+    if [ "$force" -eq 0 ]; then
+        if [ "$cur" = "0.0.0-dev" ]; then
+            info "Version de développement installée : --force pour installer ${latest}."
+            return 0
+        fi
+        if ! iv_version_gt "$latest" "$cur"; then
+            ok "Déjà à jour (${cur})."
+            return 0
+        fi
+    fi
+
+    tmpd="$(mktemp -d /tmp/init-vps-update.XXXXXX)" || { err "mktemp impossible."; exit 1; }
+    # shellcheck disable=SC2064
+    trap "rm -rf '${tmpd}'" EXIT
+    base="https://github.com/${repo}/releases/download/v${latest}"
+    info "Téléchargement de ${latest} depuis github.com/${repo}…"
+    if ! curl -fsSL --max-time 60 -o "${tmpd}/init-vps.sh" "${base}/init-vps.sh" \
+        || ! curl -fsSL --max-time 30 -o "${tmpd}/init-vps.sh.sha256" "${base}/init-vps.sh.sha256"; then
+        err "Téléchargement impossible (${base}/init-vps.sh et .sha256)."
+        exit 1
+    fi
+    # Une seule ligne, portant sur init-vps.sh : sinon `sha256sum -c` vérifierait
+    # le fichier que la somme désigne, pas celui qu'on va exécuter.
+    if [ "$(wc -l < "${tmpd}/init-vps.sh.sha256")" -ne 1 ] \
+        || ! grep -qxE '[0-9a-f]{64} [ *]init-vps\.sh' "${tmpd}/init-vps.sh.sha256" \
+        || ! (cd "$tmpd" && sha256sum -c --status init-vps.sh.sha256); then
+        err "Somme SHA-256 invalide : téléchargement corrompu ou tronqué. Abandon."
+        exit 1
+    fi
+    if ! bash -n "${tmpd}/init-vps.sh"; then
+        err "Script téléchargé syntaxiquement invalide. Abandon."
+        exit 1
+    fi
+    if ! grep -qxF "SCRIPT_VERSION=\"${latest}\"" "${tmpd}/init-vps.sh"; then
+        err "Le script téléchargé n'est pas marqué ${latest}. Abandon."
+        exit 1
+    fi
+
+    printf '%b\n' "${C_BOLD}Mise à jour : ${cur} → ${latest} (github.com/${repo})${C_RESET}"
+    if [ "$yes" -eq 0 ] && ! ask_yes_no "Appliquer la mise à jour (init-vps.sh --update) ?"; then
+        info "Annulé."
+        exit 0
+    fi
+    self_update_launch "${tmpd}/init-vps.sh" "$tmpd"
 }
 
 cmd_traefik_tuning() {
@@ -2507,6 +2791,41 @@ check_restart_policies() {
 #     Chiffres retirés avant comparaison : « depuis 8 j » puis « 9 j » n'est
 #     pas nouveau ; un nouveau conteneur, une nouvelle unit, un disque, si ;
 #   - retour au vert → le dernier message d'alerte est MODIFIÉ (silencieux).
+#
+# Corps lisible sur Discord : échecs groupés par section (ordre d'apparition),
+# « sujet : détail » sur deux lignes. Marqueurs Markdown retirés hors Discord.
+check_fail_body() {
+    local b="**" u="__" entry sect msg s out="" first known
+    local -a sects=()
+    if ! grep -qE 'discord(app)?\.com/api/webhooks/' "$NOTIFY_ENV" 2>/dev/null; then
+        b="" u=""
+    fi
+    for entry in "${CHK_FAIL_MSGS[@]}"; do
+        sect="${entry%%$'\t'*}"
+        known=0
+        for s in "${sects[@]}"; do
+            if [ "$s" = "$sect" ]; then known=1; break; fi
+        done
+        [ "$known" -eq 1 ] || sects+=("$sect")
+    done
+    for s in "${sects[@]}"; do
+        [ -n "$out" ] && out+=$'\n\n\n'
+        out+="${u}${b}${s:-Audit}${b}${u}"
+        first=1
+        for entry in "${CHK_FAIL_MSGS[@]}"; do
+            [ "${entry%%$'\t'*}" = "$s" ] || continue
+            msg="${entry#*$'\t'}"
+            if [ "$first" -eq 1 ]; then out+=$'\n'; first=0; else out+=$'\n\n'; fi
+            if [[ "$msg" == *" : "* ]]; then
+                out+="${b}${msg%% : *}${b}"$'\n'"↳ ${msg#* : }"
+            else
+                out+="↳ ${msg}"
+            fi
+        done
+    done
+    printf '%s' "$out"
+}
+
 check_notify_failures() {
     command -v vps-notify >/dev/null 2>&1 || return 0
     local state="${IV_LIB}/check-notify.state" body hash now id last_hash="" last_ts=0 last_id=""
@@ -2523,7 +2842,7 @@ check_notify_failures() {
         return 0
     fi
 
-    body="$(printf '• %s\n' "${CHK_FAIL_MSGS[@]}")"
+    body="$(check_fail_body)"
     hash="$(tr -d '0-9' <<< "$body" | sha256sum | cut -d' ' -f1)"
     if [ "$hash" = "$last_hash" ] && [ $((now - ${last_ts:-0})) -lt 604800 ]; then
         return 0
@@ -2931,6 +3250,17 @@ cmd_check() {
     local swarm_state
     swarm_state=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "N/A")
     chk_info "Docker Swarm : ${swarm_state}"
+    # Jamais FAIL ni WARN : une nouvelle release ne doit pas déclencher d'alerte.
+    iv_latest_refresh 21600
+    if [ "$INIT_VPS_VERSION" = "0.0.0-dev" ]; then
+        chk_info "init-vps ${INIT_VPS_VERSION} — version de développement"
+    elif iv_update_available; then
+        chk_info "init-vps ${INIT_VPS_VERSION} — $(iv_latest) disponible"
+    elif iv_latest >/dev/null; then
+        chk_info "init-vps ${INIT_VPS_VERSION} — à jour"
+    else
+        chk_info "init-vps ${INIT_VPS_VERSION} — dernière version non vérifiable"
+    fi
 
     printf '\n'
     if [[ "${fail}" -eq 0 ]]; then
@@ -2963,7 +3293,8 @@ case "$CMD" in
     reboot-auto)    shift; cmd_reboot_auto "$@" ;;
     reboot-skip)    cmd_reboot_skip ;;
     reboot-status)  cmd_reboot_status ;;
-    version)        cmd_version ;;
+    version)        shift; cmd_version "$@" ;;
+    self-update)    shift; cmd_self_update "$@" ;;
     help|--help|-h) print_help ;;
     *)
         err "Commande inconnue : « ${CMD} »."
@@ -2972,9 +3303,11 @@ case "$CMD" in
         ;;
 esac
 HELPEREOF
-    sed -i "s/^INIT_VPS_VERSION=.*/INIT_VPS_VERSION=\"${SCRIPT_VERSION}\"/" /usr/local/bin/vps-helper
-    sed -i "s/^DEFAULT_ADMIN_USER=.*/DEFAULT_ADMIN_USER=\"${ADMIN_USER}\"/" /usr/local/bin/vps-helper
-    chmod +x /usr/local/bin/vps-helper
+    sed -i "s/^INIT_VPS_VERSION=.*/INIT_VPS_VERSION=\"${SCRIPT_VERSION}\"/" "$helper_tmp"
+    sed -i "s|^INIT_VPS_REPO_DEFAULT=.*|INIT_VPS_REPO_DEFAULT=\"${INIT_VPS_REPO}\"|" "$helper_tmp"
+    sed -i "s/^DEFAULT_ADMIN_USER=.*/DEFAULT_ADMIN_USER=\"${ADMIN_USER}\"/" "$helper_tmp"
+    chmod 755 "$helper_tmp"
+    mv -f "$helper_tmp" /usr/local/bin/vps-helper
     log_ok "Commande vps-helper installée (vps-helper help pour la liste des commandes)."
 }
 
@@ -3410,7 +3743,10 @@ step_notify() {
     # vps-notify et l'unit d'échec sont toujours installés : sans webhook ils
     # sont inertes, et les units OnFailure= qui les référencent restent valides.
     backup_file /usr/local/bin/vps-notify
-    cat > /usr/local/bin/vps-notify <<'NOTIFYEOF'
+    # Écrit à côté puis renommé (voir CLAUDE.md, « Écriture des fichiers générés »).
+    local notify_tmp
+    notify_tmp="$(mktemp /usr/local/bin/.vps-notify.XXXXXX)"
+    cat > "$notify_tmp" <<'NOTIFYEOF'
 #!/usr/bin/env bash
 # vps-notify — envoie une notification au webhook configuré. Généré par init-vps.sh.
 #
@@ -3497,7 +3833,17 @@ case "$(grep -oP '^SERVER_ROLE="\K[12]' "$STATE_FILE" 2>/dev/null)" in
     *) role="—" ;;
 esac
 ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-version="$(/usr/local/bin/vps-helper version 2>/dev/null)"
+version="$(/usr/local/bin/vps-helper version --short 2>/dev/null)"
+# Dernière version : cache de vps-helper, lu directement, jamais de réseau.
+# Comparaison dupliquée dans vps-helper (iv_update_available) et le MOTD.
+latest=""
+if [ -n "$version" ] && [ "$version" != "0.0.0-dev" ] && [ -r /var/lib/init-vps/latest-version ]; then
+    read -r latest _ < /var/lib/init-vps/latest-version
+    if ! [[ "$latest" =~ ^[0-9]+(\.[0-9]+)*$ ]] || [ "$latest" = "$version" ] \
+        || [ "$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n 1)" != "$latest" ]; then
+        latest=""
+    fi
+fi
 case "$NOTIFY_WEBHOOK_URL" in
     *discord.com/api/webhooks/*|*discordapp.com/api/webhooks/*) kind=discord ;;
     *) kind=other ;;
@@ -3506,7 +3852,7 @@ esac
 # JSON construit par python3 : échappement correct de tout contenu (journal
 # d'une unit, noms de conteneurs…), sans bricolage de chaînes en bash.
 payload="$(TITLE="$(clean "$title")" BODY="$(clean "$body")" LEVEL="$level" CODE="${unit:+1}" \
-    HOST="$(hostname)" ROLE="$role" IP="${ip:-?}" VERSION="${version:-?}" KIND="$kind" EDIT="$edit_id" \
+    HOST="$(hostname)" ROLE="$role" IP="${ip:-?}" VERSION="${version:-?}" LATEST="$latest" KIND="$kind" EDIT="$edit_id" \
     python3 -c '
 import datetime, json, os
 e = os.environ
@@ -3517,6 +3863,9 @@ body = e["BODY"]
 if e["CODE"] and body:
     body = "```\n" + body[-3800:] + "\n```"
 body = body[:4000]
+version = e["VERSION"]
+if e["LATEST"]:
+    version += " → **" + e["LATEST"] + "** disponible"
 if e["KIND"] == "discord":
     embed = {
         "author": {"name": e["HOST"]},
@@ -3525,8 +3874,9 @@ if e["KIND"] == "discord":
         "fields": [
             {"name": "Rôle", "value": e["ROLE"], "inline": True},
             {"name": "IP", "value": e["IP"], "inline": True},
+            {"name": "Version", "value": version, "inline": True},
         ],
-        "footer": {"text": "init-vps " + e["VERSION"]},
+        "footer": {"text": "init-vps"},
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     if body:
@@ -3568,7 +3918,8 @@ if [ "$print_id" -eq 1 ]; then
 fi
 exit 0
 NOTIFYEOF
-    chmod 750 /usr/local/bin/vps-notify
+    chmod 750 "$notify_tmp"
+    mv -f "$notify_tmp" /usr/local/bin/vps-notify
 
     # « - » devant ExecStart : sans webhook, l'échec d'envoi ne doit pas créer
     # une unit en échec de plus — que `check` signalerait à son tour.
@@ -3782,6 +4133,36 @@ LAST_RUN="$(date -Iseconds)"
 EOF
     chmod 600 "$STATE_FILE"
     log_ok "Configuration sauvegardée dans ${STATE_FILE} (réutilisée par le mode mise à jour)."
+}
+
+###############################################################################
+# COPIE DU SCRIPT — retour arrière (vps-helper self-update --rollback)
+###############################################################################
+# Garde le script qui vient de réussir dans /usr/local/lib/init-vps/init-vps.sh
+# et renomme l'ancienne copie en init-vps.prev.sh, seulement si la version a
+# changé — y compris après une mise à jour manuelle par curl. Via `curl | bash`,
+# aucun fichier à copier : ignoré en silence.
+save_script_copy() {
+    local src="${BASH_SOURCE[0]:-}" dir=/usr/local/lib/init-vps cur prev_ver="" tmp
+    [[ -n "$src" && -f "$src" && -r "$src" ]] || return 0
+    # Garde-fou : $src doit bien être ce script (BASH_SOURCE vaut « main » sous stdin).
+    grep -qxF "SCRIPT_VERSION=\"${SCRIPT_VERSION}\"" "$src" 2>/dev/null || return 0
+    cur="${dir}/init-vps.sh"
+    if [[ -f "$cur" ]]; then
+        prev_ver="$(grep -m1 -oP '^SCRIPT_VERSION="\K[^"]*' "$cur" 2>/dev/null || true)"
+        [[ "$prev_ver" == "$SCRIPT_VERSION" ]] && return 0
+    fi
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    # Copie AVANT tout renommage : pendant un --rollback, $src EST init-vps.prev.sh.
+    tmp="$(mktemp "${dir}/.init-vps.XXXXXX")"
+    cp "$src" "$tmp"
+    chmod 700 "$tmp"
+    if [[ -f "$cur" ]]; then
+        mv -f "$cur" "${dir}/init-vps.prev.sh"
+    fi
+    mv -f "$tmp" "$cur"
+    log_info "Script conservé : ${cur}${prev_ver:+ (précédent : ${prev_ver}, init-vps.prev.sh)}."
 }
 
 ###############################################################################
@@ -4119,6 +4500,7 @@ main() {
     step_notify
     step_save_state
     step_auto_reboot
+    save_script_copy
 
     print_summary
     offer_password_cleanup

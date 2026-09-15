@@ -13,7 +13,29 @@ Ce dépôt contient **un seul fichier** : `init-vps.sh`. Il est conçu pour êtr
 
 Chaque heredoc a sa porte d'extraction + `bash -n` dans `lint.yml`. Tout nouveau heredoc en ajoute une.
 
-Les deux heredocs utilisent des délimiteurs **entre guillemets simples** (`<<'MOTDEOF'`, `<<'HELPEREOF'`), ce qui signifie qu'aucune variable du script parent n'est interpolée à l'intérieur — à l'exception de `SCRIPT_VERSION` et `DEFAULT_ADMIN_USER` dans `HELPEREOF`, injectées via deux `sed -i` après l'écriture du fichier (voir `step_vps_helper`).
+Les heredocs utilisent des délimiteurs **entre guillemets simples** (`<<'MOTDEOF'`, `<<'HELPEREOF'`…), ce qui signifie qu'aucune variable du script parent n'est interpolée à l'intérieur — à l'exception de `SCRIPT_VERSION`, `INIT_VPS_REPO` et `DEFAULT_ADMIN_USER` dans `HELPEREOF`, injectées via trois `sed -i` sur le fichier temporaire, avant son renommage (voir `step_vps_helper` et « Écriture des fichiers générés »).
+
+### Écriture des fichiers générés : temporaire + `mv`
+
+`step_motd`, `step_vps_helper` et `step_notify` n'écrivent **jamais** directement
+leur cible : `mktemp` **dans le même répertoire** (`.vps-helper.XXXXXX`…), `sed -i`
+et `chmod` sur ce fichier, puis `mv -f` vers la cible.
+
+Raison : bash lit un script **au fur et à mesure**. Un `cat >` sur un script en
+cours d'exécution le tronque puis le réécrit sous le processus qui le lit —
+exactement ce qui arriverait à `vps-helper self-update`. Le renommage est atomique
+(même système de fichiers) : le fichier n'est jamais vu à moitié écrit, et un
+processus en cours garde l'ancien inode. Les noms temporaires commencent par un
+point : `run-parts` (MOTD) les ignore.
+
+⚠️ Conséquence pour `lint.yml` : les motifs d'extraction de `MOTDEOF` et
+`HELPEREOF` sont ancrés sur la **fin** de ligne (`<<'HELPEREOF'$`), comme celui de
+`NOTIFYEOF`, et non plus sur `cat > /chemin`.
+
+### Heredoc imbriqué `LAUNCHEOF` dans `HELPEREOF`
+
+`self_update_launch` écrit le lanceur de `self-update` via un heredoc `LAUNCHEOF`,
+texte littéral pour `HELPEREOF` comme `FRAGEOF`. Ne pas le renommer.
 
 ### Heredoc imbriqué `FRAGEOF` dans `HELPEREOF`
 
@@ -256,7 +278,8 @@ déjà tout, `vps-helper check --notify` (timer quotidien `vps-check.timer`), pl
   `[--level fail|warn|ok|info] [--edit ID] [--print-id] "Titre" ["Détail"]`, ou
   `--unit NAME`. Codes : 0 envoyé, 1 échec, 2 usage, 3 aucun webhook.
 - **Un seul webhook pour tous les serveurs** : sur Discord, embed avec le
-  hostname en auteur, rôle + IP en champs, version en pied, couleur par niveau.
+  hostname en auteur, rôle + IP + version en champs (`X → **Y** disponible` si le
+  cache connaît une version plus récente), `init-vps` en pied, couleur par niveau.
   Le JSON est construit par `python3` (échappement sûr d'un journal d'unit) —
   **ne pas revenir à un échappement bash à la main**.
 - **Règle anti-bruit, unique** : `fail`/`warn` notifient ; `ok`/`info` partent
@@ -267,6 +290,12 @@ déjà tout, `vps-helper check --notify` (timer quotidien `vps-check.timer`), pl
   message `fail` dont l'ID est gardé dans `check-notify.state` ; liste identique
   (chiffres retirés) → rien avant 7 jours ; retour au vert → **modification** du
   message d'alerte.
+- Corps de l'alerte (`check_fail_body`) : `chk_sect` mémorise `CHK_CUR_SECT`,
+  `chk_fail` enregistre `section<TAB>message`. Échecs groupés par section (ordre
+  d'apparition), titre `__**Section**__`, `sujet : détail` rendu `**sujet**` puis
+  `↳ détail` à la ligne ; une ligne vide entre échecs, deux entre sections.
+  Marqueurs retirés hors Discord. ⚠️ Ce changement de format a modifié le hash :
+  **une** notification en double juste après la mise à jour, c'est attendu.
 - L'URL est un secret : `/etc/init-vps/notify.env` (600, `printf %q`), saisie
   masquée (`prompt_secret`, `vps-helper notify-set`), **jamais** dans
   `config.env` ni le log. `config.env` ne garde que `NOTIFY_ENABLED`.
@@ -336,6 +365,61 @@ sont absents ou si la chaîne v6 contient des règles tierces. Tant que l'IPv6 e
 désactivé dans Docker, ce trafic passe par docker-proxy (INPUT, donc UFW) et le
 miroir est sans effet ; il protège le jour où `"ipv6": true` est activé.
 `cmd_check` FAIL uniquement si l'IPv6 Docker est actif **et** la chaîne v6 vide.
+
+### Versions, dépôt des releases et `vps-helper self-update`
+
+**Dépôt jamais écrit en dur dans la logique.** `INIT_VPS_REPO` (tête du parent,
+`studiokyne/init-vps` sur `main`) est remplacé à la publication par
+`${{ github.repository }}` (`auto-release.yml`, même motif `0,/…/` et même
+garde-fou `grep -q` que `SCRIPT_VERSION`) : une release publiée depuis un autre
+dépôt pointe d'elle-même vers lui. `step_vps_helper` l'injecte dans
+`INIT_VPS_REPO_DEFAULT`. Surcharge manuelle : `/etc/init-vps/repo` (une ligne
+`owner/name`, 644), lue par `iv_repo()` si valide — **pas** dans `config.env`, que
+`step_save_state` réécrit.
+
+- Dépôt **transféré** : GitHub redirige l'ancienne URL, les serveurs non mis à
+  jour continuent de fonctionner (`curl -L`).
+- Dépôt **recréé** ailleurs : aucune redirection. Lancer une fois sur chaque
+  serveur `sudo vps-helper self-update --repo nouvel-owner/init-vps`.
+
+**Nouvelle version — sans l'API GitHub** (quota) : `iv_latest_refresh` lit l'URL
+finale de la redirection `…/releases/latest` → `/releases/tag/vX`. Cache
+`/var/lib/init-vps/latest-version` (« version epoch », 644). Échec = ancien cache
+gardé, aucun message.
+
+| Appelant | Rafraîchissement |
+|---|---|
+| `check` (timer quotidien) | 6 h |
+| `version` | 1 h (sans root : pas d'écriture, valeur gardée pour l'appel) |
+| `self-update` | à chaque appel |
+| MOTD, `status`, vps-notify | **jamais** : cache seul (connexion SSH) |
+
+La comparaison (`sort -V`, strictement supérieure, `0.0.0-dev` jamais à jour) est
+**dupliquée** dans vps-helper (`iv_update_available`), le MOTD et vps-notify :
+les garder synchronisées. `check` n'en fait **qu'une INFO** — une release ne doit
+jamais déclencher d'alerte. Pas de notification dédiée.
+
+`version --short` : le numéro seul. **Tout appelant qui lit la sortie de
+`vps-helper version` doit passer `--short`** (MOTD, vps-notify).
+
+**`self-update`** (root via `NEED_ROOT_CMDS`, terminal exigé sauf `--repo`) :
+rafraîchit, télécharge `init-vps.sh` + `init-vps.sh.sha256` de la release dans un
+`mktemp -d`, arrête à la moindre anomalie (`.sha256` d'une seule ligne portant sur
+`init-vps.sh`, `sha256sum -c`, `bash -n`, `SCRIPT_VERSION` attendue), confirme
+(défaut non, `--yes`), puis `exec bash <lanceur>`. Le lanceur exécute
+`init-vps.sh --update`, puis `vps-helper check` si succès, puis supprime son
+répertoire. **vps-helper ne se remplace jamais pendant qu'il s'exécute.**
+
+⚠️ La somme SHA-256 détecte un téléchargement **corrompu ou tronqué**, pas un
+compte GitHub compromis : elle vient de la même release que le script.
+
+**Retour arrière** : `save_script_copy` (fin de `main`, après une installation ou
+un `--update` réussis, **y compris par curl**) copie le script dans
+`/usr/local/lib/init-vps/init-vps.sh` (700) et renomme l'ancienne copie en
+`init-vps.prev.sh`, seulement si la version change. Sous `curl | bash`, pas de
+fichier : ignoré. La copie vers un temporaire précède tout renommage, car pendant
+un `--rollback` le script qui tourne **est** `init-vps.prev.sh` ; après un
+rollback, les deux copies sont simplement permutées.
 
 ### Rôle du serveur (`SERVER_ROLE`) — manager vs remote server
 
@@ -501,15 +585,15 @@ bash -n init-vps.sh
 shellcheck --severity=warning init-vps.sh
 
 # Extraire et tester le heredoc MOTD
-awk "/cat > \/etc\/update-motd.d\/00-studiokyne <<'MOTDEOF'/{p=1;next} /^MOTDEOF$/{p=0} p" \
+awk "/<<'MOTDEOF'\$/{p=1;next} /^MOTDEOF\$/{p=0} p" \
   init-vps.sh > /tmp/motd_check.sh && [ -s /tmp/motd_check.sh ] && bash -n /tmp/motd_check.sh && echo "MOTD OK"
 
 # Extraire et tester le heredoc vps-helper
-awk "/cat > \/usr\/local\/bin\/vps-helper <<'HELPEREOF'/{p=1;next} /^HELPEREOF$/{p=0} p" \
+awk "/<<'HELPEREOF'\$/{p=1;next} /^HELPEREOF\$/{p=0} p" \
   init-vps.sh > /tmp/helper_check.sh && [ -s /tmp/helper_check.sh ] && bash -n /tmp/helper_check.sh && echo "vps-helper OK"
 ```
 
-⚠️ Le motif awk ne doit **pas** ancrer `cat` en début de ligne (`^cat`) : les deux heredocs sont écrits depuis l'intérieur d'une fonction (`step_motd`, `step_vps_helper`) et sont donc indentés. Un motif ancré matche 0 ligne, produit un fichier vide, et `bash -n` sur un fichier vide « réussit » silencieusement (faux positif) — c'est resté un bug non détecté dans `lint.yml` jusqu'à ce que ce soit corrigé. Le `[ -s ... ]` avant `bash -n` garde ce piège détectable si ça régresse.
+⚠️ Le motif awk ne doit **pas** ancrer `cat` en début de ligne (`^cat`) : les heredocs sont écrits depuis l'intérieur d'une fonction (`step_motd`, `step_vps_helper`) et sont donc indentés. Il ne doit pas non plus viser le chemin cible : ils sont écrits dans un fichier temporaire (`cat > "$helper_tmp"`), d'où l'ancrage sur la fin de ligne `<<'HELPEREOF'$`. Un motif ancré matche 0 ligne, produit un fichier vide, et `bash -n` sur un fichier vide « réussit » silencieusement (faux positif) — c'est resté un bug non détecté dans `lint.yml` jusqu'à ce que ce soit corrigé. Le `[ -s ... ]` avant `bash -n` garde ce piège détectable si ça régresse.
 
 ---
 
@@ -543,6 +627,11 @@ ligne du heredoc de `step_save_state` qui écrit `config.env`, laquelle doit res
 substitution a bien eu lieu : sans lui, un motif devenu obsolète publierait un script marqué
 `0.0.0-dev` en silence.
 
+Même mécanisme pour `INIT_VPS_REPO` (délimiteur `|`, le nom contient un `/`), avec
+son propre garde-fou. L'étape produit aussi `init-vps.sh.sha256` (`cd /tmp &&
+sha256sum init-vps.sh`), publié à côté du script et lu par `vps-helper
+self-update`.
+
 Format de version : `YYYY.MM.DD.N` (N incrémental sur la journée, repart à 1 chaque jour).
 Exemple : `v2026.06.21.1`, puis `v2026.06.21.2` si un second push a lieu le même jour.
 
@@ -565,7 +654,8 @@ toute publication passe par `auto-release.yml`, tout contrôle vit dans `lint.ym
 ## Versioning
 
 - La constante `SCRIPT_VERSION="0.0.0-dev"` est présente dans le script source sur `main`.
-- Un push sur `main` calcule automatiquement la version `YYYY.MM.DD.N` et la substitue dans la copie publiée.
+- Un push sur `main` calcule automatiquement la version `YYYY.MM.DD.N` et la substitue dans la copie publiée, avec `INIT_VPS_REPO` (dépôt qui publie) ; la release porte `init-vps.sh` et `init-vps.sh.sha256`.
+- Sur un serveur : `vps-helper version` indique si une version plus récente existe, `sudo vps-helper self-update` l'installe (voir « Versions, dépôt des releases et `vps-helper self-update` »).
 - La version est incluse dans le résumé final (`print_summary()`) et dans le log `/var/log/init-vps.log`.
 
 ---

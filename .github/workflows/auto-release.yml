@@ -36,18 +36,31 @@ jobs:
           echo "version=${DATE}.${N}" >> "$GITHUB_OUTPUT"
 
       - name: Build versioned script
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
         run: |
           # `0,/re/s//…/` = première occurrence SEULEMENT. `^SCRIPT_VERSION=`
           # matche aussi la ligne du heredoc de step_save_state (config.env),
           # qu'on ne veut pas figer : elle doit rester ${SCRIPT_VERSION}.
-          sed "0,/^SCRIPT_VERSION=.*/s//SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"/" \
+          # INIT_VPS_REPO : le dépôt qui publie. Une release publiée depuis un
+          # autre dépôt (migration) pointe donc d'elle-même vers ce dépôt.
+          # Délimiteur `|` : le nom du dépôt contient un `/`.
+          sed -e "0,/^SCRIPT_VERSION=.*/s//SCRIPT_VERSION=\"${VERSION}\"/" \
+              -e "0,/^INIT_VPS_REPO=.*/s|^INIT_VPS_REPO=.*|INIT_VPS_REPO=\"${REPO}\"|" \
             init-vps.sh > /tmp/init-vps.sh
           chmod +x /tmp/init-vps.sh
           bash -n /tmp/init-vps.sh
-          # Garde-fou : le sed doit avoir réellement substitué la version, sinon
-          # on publierait un script marqué 0.0.0-dev sans que rien ne le signale.
-          grep -q "^SCRIPT_VERSION=\"${{ steps.version.outputs.version }}\"$" /tmp/init-vps.sh \
+          # Garde-fous : les sed doivent avoir réellement substitué, sinon on
+          # publierait un script marqué 0.0.0-dev (ou pointant vers un autre
+          # dépôt) sans que rien ne le signale.
+          grep -q "^SCRIPT_VERSION=\"${VERSION}\"$" /tmp/init-vps.sh \
             || { echo "::error::SCRIPT_VERSION non substituée — le motif sed ne matche plus init-vps.sh"; exit 1; }
+          grep -q "^INIT_VPS_REPO=\"${REPO}\"$" /tmp/init-vps.sh \
+            || { echo "::error::INIT_VPS_REPO non substitué — le motif sed ne matche plus init-vps.sh"; exit 1; }
+          # Somme lue par `vps-helper self-update` : détecte un téléchargement
+          # corrompu ou tronqué, PAS un compte compromis (même release).
+          cd /tmp && sha256sum init-vps.sh > init-vps.sh.sha256
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
@@ -55,4 +68,6 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "init-vps ${{ steps.version.outputs.version }}"
           generate_release_notes: true
-          files: /tmp/init-vps.sh
+          files: |
+            /tmp/init-vps.sh
+            /tmp/init-vps.sh.sha256
