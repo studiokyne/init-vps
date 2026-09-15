@@ -171,7 +171,29 @@ Deux mécanismes, deux sources, **les deux** sont nécessaires :
 Un compteur non nul est concluant quel que soit l'âge ; un `max 0` sur un
 conteneur démarré depuis moins de `MEM_EVENTS_MIN_AGE` (24 h) est affiché
 « non concluant », **jamais PASS**. Un faux négatif ici est pire que pas de check.
-`memory.peak` ≥ 90 % de `memory.max` → WARN (alerte précoce). Un conteneur sans
+
+**`max > 0` ne suffit pas.** Mesuré sur un cron WordPress limité à 512M :
+`max 13945` en 15 h, `oom_kill 0`, `memory.peak` = limite ; `memory.stat` :
+`anon` 152 Kio, `file` 217 Mio, `pgmajfault` 48. Le noyau libère du cache de
+pages froid : c'est bénin. `workingset_refault_file` (374 007) ne tranche pas :
+`wp` relit ses fichiers PHP à chaque cycle. Le critère retenu est le **coût moyen
+d'un reclaim** : `full total` de `memory.pressure` (µs, PSI) ÷ `max` — ici
+`total=1208074`, soit 1,2 s bloqué en 15 h, ~87 µs par reclaim.
+
+| Cas | Verdict |
+|---|---|
+| `oom_kill > 0` | FAIL |
+| `max > 0`, PSI illisible | FAIL |
+| `max > 0`, coût ≥ 1 ms | FAIL « thrashing » |
+| `max > 0`, coût < 1 ms | INFO, puis logique d'âge habituelle |
+
+⚠️ `MEM_RECLAIM_COST_FAIL_US=1000` est **provisoire** : jamais mesuré sur un cas
+malade, calibration en cours. Méthode : `docker update --memory 128m` sur un cron
+de test pendant 2 h, relever `max` et `full total`, remettre 512M, puis
+`docker restart` pour remettre les compteurs à zéro.
+
+`memory.peak` ≥ 90 % de `memory.max` → WARN (alerte précoce), sauf si la limite
+est déjà atteinte sans coût. Un conteneur sans
 limite (`max`) n'est pas « throttlable » : il est seulement compté.
 
 Les fonctions `check_*` incrémentent `pass`/`fail` de `cmd_check` par portée

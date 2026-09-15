@@ -2098,6 +2098,15 @@ cmd_docker_firewall() {
 # un cycle complet (tâches nocturnes, pic de trafic de la journée).
 MEM_EVENTS_MIN_AGE=86400
 
+# Coût moyen d'un reclaim (µs de blocage PSI « full » ÷ compteur `max`) à partir
+# duquel une limite atteinte devient un vrai problème. `max > 0` seul ne suffit
+# pas — mesuré sur un cron WordPress à 512M : max 13 945 en 15 h, oom_kill 0,
+# peak = limite, mais anon 152 Kio / file 217 Mio : le noyau libère du cache de
+# pages froid. full total=1208074, soit 1,2 s bloqué en 15 h, ~87 µs par reclaim.
+# (workingset_refault_file à 374 007 ne tranche pas : wp relit ses PHP à chaque
+# cycle.) Seuil PROVISOIRE : jamais mesuré sur un cas malade (voir CLAUDE.md).
+MEM_RECLAIM_COST_FAIL_US=1000
+
 human_bytes() { numfmt --to=iec --suffix=o "$1" 2>/dev/null || echo "${1} o"; }
 
 human_age() {
@@ -2138,6 +2147,8 @@ container_cgroup_dir() {
 #     lieu de tuer, le service survit mais thrashe. Seul le compteur `max` de
 #     memory.events le trahit. Mesuré en production : 35 652 fois en quelques
 #     semaines, conteneur « Up (healthy »), aucun log applicatif.
+#   - coût du throttling → memory.pressure (PSI) : `max` compte aussi les
+#     reclaims de cache de pages bénins, seul le temps bloqué les distingue.
 check_container_memory() {
     chk_sect "Mémoire des conteneurs"
     if ! command -v docker >/dev/null 2>&1; then
@@ -2181,6 +2192,8 @@ check_container_memory() {
         return
     fi
     local now full pid started dir max_ev oom_ev limit peak age start_s ratio
+    local stall_us cost_us benign
+    local -a cheap=()
     local ok_n=0 unlimited_n=0 unreadable_n=0
     now=$(date +%s)
     while read -r name full pid started; do
@@ -2194,18 +2207,39 @@ check_container_memory() {
         start_s=$(date -d "$started" +%s 2>/dev/null || echo "$now")
         age=$((now - start_s))
 
-        # Un compteur non nul est concluant quel que soit l'âge du conteneur.
-        if [ "${max_ev:-0}" -gt 0 ] || [ "${oom_ev:-0}" -gt 0 ]; then
-            chk_fail "${name} : limite mémoire atteinte ${max_ev:-0} fois (throttling), ${oom_ev:-0} OOM kill(s) en $(human_age "$age") — limite $(human_bytes "$limit")"
+        # Un OOM kill est concluant quel que soit l'âge du conteneur.
+        if [ "${oom_ev:-0}" -gt 0 ]; then
+            chk_fail "${name} : ${oom_ev} OOM kill(s) en $(human_age "$age") (limite $(human_bytes "$limit"), atteinte ${max_ev:-0} fois)"
             fail=$((fail+1))
             continue
+        fi
+        # Limite atteinte : bénin si le noyau n'a libéré que du cache froid, grave
+        # s'il bloque les process. Seul le coût moyen d'un reclaim (PSI) tranche.
+        benign=0
+        if [ "${max_ev:-0}" -gt 0 ]; then
+            stall_us=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^total=/) { sub(/^total=/, "", $i); print $i } }' \
+                "${dir}/memory.pressure" 2>/dev/null)
+            if ! [[ "$stall_us" =~ ^[0-9]+$ ]]; then
+                chk_fail "${name} : limite atteinte ${max_ev} fois en $(human_age "$age"), coût inconnu (PSI illisible) — limite $(human_bytes "$limit")"
+                fail=$((fail+1))
+                continue
+            fi
+            cost_us=$((stall_us / max_ev))
+            if [ "$cost_us" -ge "$MEM_RECLAIM_COST_FAIL_US" ]; then
+                chk_fail "${name} : thrashing — limite atteinte ${max_ev} fois, $(awk -v u="$stall_us" 'BEGIN { printf "%.1f", u / 1000000 }') s bloqué ($(awk -v u="$cost_us" 'BEGIN { printf "%.1f", u / 1000 }') ms par reclaim) en $(human_age "$age") — limite $(human_bytes "$limit")"
+                fail=$((fail+1))
+                continue
+            fi
+            cheap+=("${name} (${max_ev} reclaims, ${cost_us} µs chacun)")
+            benign=1
         fi
         if [ -z "$limit" ] || [ "$limit" = "max" ]; then
             unlimited_n=$((unlimited_n+1))
             continue
         fi
         # Alerte précoce : le pic approche la limite avant que `max` ne bouge.
-        if [ -n "$peak" ] && [ "$limit" -gt 0 ]; then
+        # Sans objet si la limite est déjà atteinte sans coût (peak = limite).
+        if [ "$benign" -eq 0 ] && [ -n "$peak" ] && [ "$limit" -gt 0 ]; then
             ratio=$((peak * 100 / limit))
             if [ "$ratio" -ge 90 ]; then
                 chk_warn "${name} : pic mémoire à ${ratio} % de la limite ($(human_bytes "$peak") / $(human_bytes "$limit")) — throttling imminent"
@@ -2222,6 +2256,10 @@ check_container_memory() {
 
     if [ "$ok_n" -gt 0 ]; then
         chk_pass "${ok_n} conteneur(s) limité(s) sans throttling ni OOM depuis au moins $(human_age "$MEM_EVENTS_MIN_AGE")"; pass=$((pass+1))
+    fi
+    if [ "${#cheap[@]}" -gt 0 ]; then
+        chk_info "Limite atteinte sans blocage notable (cache de pages libéré, sans effet sur les process) :"
+        printf '      %s\n' "${cheap[@]}"
     fi
     if [ "${#young[@]}" -gt 0 ]; then
         chk_info "Non concluant pour ${#young[@]} conteneur(s) récent(s) — compteurs remis à zéro à chaque recréation :"
